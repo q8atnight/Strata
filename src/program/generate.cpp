@@ -360,6 +360,7 @@ struct Options {
     int64_t conversation_cache_mib = 0; // opt-in host RAM for independent conversations
     int conversation_cache_slots = 4;
     int64_t conversation_cache_min_free_mib = 2560;
+    int64_t conversation_cache_min_tokens = 0;   // dual-3090: do not park conversations shorter than this (0 = park all)
     /// --serve: also keep a checkpoint every N freshly read prompt tokens (0 = only at the last turn boundary)
     int64_t prompt_cache_every = 16384;
     /// --serve: a prompt read from token 0 is also checkpointed at its first turn boundary - the end of the system
@@ -466,6 +467,7 @@ void usage() {
                  "                       of RAM each; 0 = read every prompt from the start)\n"
                  "  --conversation-cache-mib N  --serve: RAM budget for parked conversations (default 0 = off)\n"
                  "  --conversation-cache-slots N  --serve: at most N parked conversations (default 4)\n"
+                 "  --conversation-cache-min-tokens N  --serve: do not park conversations shorter than N tokens (default 0)\n"
                  "  --conversation-cache-min-free-mib N  --serve: physical RAM floor when parking (default 2560)\n"
                  "  --prompt-cache-every N  --serve: also checkpoint every N fresh prompt tokens (default 16384, 0 = off)\n"
                  "  --turn-token ID      --serve: the token that opens a chat turn (default 248045, <|im_start|>)\n"
@@ -1102,7 +1104,7 @@ int main(int argc, char** argv) {
         else if (a == "--vision") o.vision = true;
         else if (a == "--prompt-cache") o.prompt_cache = std::max(0, std::atoi(next("--prompt-cache")));
         else if (a == "--conversation-cache-mib" || a == "--conversation-cache-slots" ||
-                 a == "--conversation-cache-min-free-mib") {
+                 a == "--conversation-cache-min-free-mib" || a == "--conversation-cache-min-tokens") {
             const std::string value = next(a.c_str());
             int64_t number = 0;
             const auto result = std::from_chars(value.data(), value.data() + value.size(), number);
@@ -1113,6 +1115,7 @@ int main(int argc, char** argv) {
             }
             if (a == "--conversation-cache-mib") o.conversation_cache_mib = number;
             else if (a == "--conversation-cache-min-free-mib") o.conversation_cache_min_free_mib = number;
+            else if (a == "--conversation-cache-min-tokens") o.conversation_cache_min_tokens = number;
             else o.conversation_cache_slots = (int) number;
         }
         else if (a == "--prompt-cache-every") o.prompt_cache_every = std::max(0LL, std::atoll(next("--prompt-cache-every")));
@@ -3782,6 +3785,9 @@ int main(int argc, char** argv) {
         // addresses change: all parked images live in ordinary host vectors.
         auto park_current = [&](size_t held) -> bool {
             if (!conversations.enabled() || !live_ok || live.empty()) return true;
+            // a short chat (a title request, a one-off question) is cheaper to read again than to park: parking
+            // copies the fixed recurrent state (~0.1 s) on every switch
+            if ((int64_t) live.size() < o.conversation_cache_min_tokens) return true;
             const strata::core::ConversationView view{live, live_imgs, checks, cvec_cached};
             auto reuse = conversations.take_reuse();
             size_t estimate = 0;

@@ -306,6 +306,19 @@ struct PeerPrefill {
     std::vector<int32_t> bounds_host;
     std::vector<void*> owned;
     int64_t layers = 0, experts = 0, rows = 0, over_cap = 0;   // stats
+    // the QSA layers' selection + attention for the chunk's last queries (query split): the peer gets the layer's
+    // staged K/V, the indexer's pooled keys and its queries over P2P, and returns its attention rows
+    bool qsa = false;
+    double qsa_frac = 0.5;
+    int64_t qsa_q_max = 0;
+    strata::kernels::KvHostPools stage;
+    int32_t* qident = nullptr;
+    float *pooled = nullptr, *dead = nullptr, *q = nullptr, *qidx = nullptr, *attn = nullptr, *scores = nullptr,
+          *ascratch = nullptr;
+    int32_t *sel = nullptr, *steps = nullptr;
+    cudaEvent_t ev_q = nullptr;       // on the primary: K/V, indexer and queries ready
+    cudaEvent_t ev_q_done = nullptr;  // on the peer: its attention rows are in the primary's buffer
+    int64_t qsa_layers = 0, qsa_queries = 0;
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
@@ -323,9 +336,11 @@ struct PeerPrefill {
         for (cudaEvent_t e : pused) if (e) cudaEventDestroy(e);
         if (s_cp) cudaStreamDestroy(s_cp);
         if (s_out) cudaStreamDestroy(s_out);
+        if (ev_q_done) cudaEventDestroy(ev_q_done);
         if (s) cudaStreamDestroy(s);
         cudaSetDevice(prev);
         if (ev_in) cudaEventDestroy(ev_in);
+        if (ev_q) cudaEventDestroy(ev_q);
     }
 };
 
@@ -915,7 +930,8 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     pp->cap_rows = std::max<int64_t>(1, std::min<int64_t>(cap_rows, m.T_max * K));
     const int64_t R = pp->cap_rows;
     const MmqPlan& mp = mmq_plan();
-    if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
+    if (cudaEventCreateWithFlags(&pp->ev_in, cudaEventDisableTiming) != cudaSuccess ||
+        cudaEventCreateWithFlags(&pp->ev_q, cudaEventDisableTiming) != cudaSuccess) { err = "prefill peer: event"; return false; }
     int prev = 0;
     cudaGetDevice(&prev);
     pp->dev = peer->device();
@@ -984,6 +1000,43 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     pp->bounds = (int32_t*) take((size_t) (2 * (NE + NE / MMQ_GROUP + 2)) * 4);
     pp->grp_gu = (uint8_t*) take(MMQ_GROUP * mp.gu_max + MMQ_TAIL);
     pp->grp_d = (uint8_t*) take(MMQ_GROUP * mp.d_max + MMQ_TAIL);
+    // the QSA query split (KV streaming layouts only: the layer's whole K/V is in one staging pool)
+    const core::QsaState& q0 = m.ss->qsa_states[0];
+    const char* qf = std::getenv("STRATA_PF_QSA_SPLIT");
+    pp->qsa_frac = qf ? std::atof(qf) : 0.5;
+    if (ok && q0.kv_mode == 1 && m.ident_table != nullptr && pp->qsa_frac > 0.0) {
+        strata::kernels::QsaShapes sh = strata::kernels::qsa_real_shapes();
+        sh.n_head = m.g->n_head; sh.n_head_kv = m.g->n_head_kv; sh.head_dim = m.g->head_dim;
+        sh.idx_n_head = m.g->idx_q_heads; sh.idx_dim = m.g->idx_key_dim;
+        const size_t rows = (size_t) q0.n_pages * sh.n_head_kv * sh.page_size;
+        if (q0.kv_q4) {
+            pp->stage.k_q4 = (uint8_t*) take(rows * strata::kernels::kv_q4_bytes_per_head((int) sh.head_dim));
+            pp->stage.v_q4 = (uint8_t*) take(rows * strata::kernels::kv_q4_bytes_per_head((int) sh.head_dim));
+        } else if (q0.kv_int8) {
+            pp->stage.k_q = (int8_t*) take(rows * sh.head_dim);
+            pp->stage.v_q = (int8_t*) take(rows * sh.head_dim);
+            pp->stage.k_scale = (uint16_t*) take(rows * (sh.head_dim / 64) * 2);
+            pp->stage.v_scale = (uint16_t*) take(rows * (sh.head_dim / 64) * 2);
+        } else {
+            pp->stage.k_pool = (uint16_t*) take(rows * sh.head_dim * 2);
+            pp->stage.v_pool = (uint16_t*) take(rows * sh.head_dim * 2);
+        }
+        pp->qident = (int32_t*) take((size_t) q0.n_pages * 4);
+        pp->pooled = (float*) take((size_t) q0.idx_pooled_rows * sh.idx_dim * 4);
+        pp->dead = (float*) take((size_t) sh.idx_dim * 4);
+        pp->qsa_q_max = (int64_t) (m.T_max * pp->qsa_frac) + 256;
+        const int64_t Q = pp->qsa_q_max;
+        pp->q = (float*) take((size_t) Q * ZV * 4);
+        pp->qidx = (float*) take((size_t) Q * 512 * 4);
+        pp->attn = (float*) take((size_t) Q * ZV * 4);
+        pp->sel = (int32_t*) take((size_t) Q * m.cap * 4);
+        pp->steps = (int32_t*) take((size_t) Q * strata::kernels::kStepCount * 4);
+        pp->scores = (float*) take((size_t) m.sel_batch * m.max_blocks * 4);
+        pp->ascratch = (float*) take((size_t) m.attn_batch * strata::kernels::qsa_decode_attn_scratch_floats(m.cap, sh) * 4);
+        if (ok) ok = cudaMemcpyPeer(pp->qident, pp->dev, m.ident_table, prev, (size_t) q0.n_pages * 4) == cudaSuccess &&
+                     cudaEventCreateWithFlags(&pp->ev_q_done, cudaEventDisableTiming) == cudaSuccess;
+        pp->qsa = ok;
+    }
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         mmq::iota(pp->ident, pp->cap_rows, pp->s);
@@ -994,10 +1047,12 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     cudaSetDevice(prev);
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
-                         "layer%s); %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
+                         "layer%s)%s; %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
                                                     "% of the primary's streamed experts through a " + std::to_string(pp->RP) + "-slot ring").c_str()
-                                                 : ", compact group buffers") : "", fb >> 20);
+                                                 : ", compact group buffers") : "",
+                 pp->qsa ? (" and the QSA selection + attention of the last " + std::to_string((int) (pp->qsa_frac * 100)) +
+                            "% of its queries").c_str() : "", fb >> 20);
     m.pp = std::move(pp);
     return true;
 }
@@ -1108,8 +1163,8 @@ struct PfTimer {
     }
 };
 // multi-GPU: the peer's own timeline (STRATA_PREFILL_TIMING): marks on the peer stream, folded with the primary's
-enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeCount };
-const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out"};
+enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeQsaIn, kPeQsaSel, kPeQsaAttn, kPeQsaOut, kPeCount };
+const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out", "qsa in", "qsa select", "qsa attn", "qsa out"};
 struct PeTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     int dev = -1;
@@ -1637,8 +1692,65 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         }
                     } catch (const std::exception& e) { err = std::string("prefill indexer: ") + e.what(); return false; }
                     pt.mark(kPfQsaSel, cs);
-                    for (int64_t t0 = 0; t0 < T; t0 += m.sel_batch) {
-                        const int64_t nb = std::min(m.sel_batch, T - t0);
+                    // multi-GPU: the peer selects and attends for queries [Tq, T) - same kernels, same per-query inputs
+                    const int64_t Tq = (m.pp && m.pp->qsa && staged && !st.kv_q4 && T >= 512)
+                                           ? std::max<int64_t>(T - m.pp->qsa_q_max + 256,
+                                                               T - (int64_t) (T * m.pp->qsa_frac) / 64 * 64)
+                                           : T;
+                    if (Tq < T) {
+                        PeerPrefill& P = *m.pp;
+                        const int64_t nq = T - Tq;
+                        cudaEventRecord(P.ev_q, m.cs);
+                        int prevd = 0;
+                        cudaGetDevice(&prevd);
+                        cudaSetDevice(P.dev);
+                        const cudaStream_t ps = P.s;
+                        cudaStreamWaitEvent(ps, P.ev_q, 0);
+                        pe.mark(kPeQsaIn, ps);
+                        const int64_t pages = (p0 + T + s.page_size - 1) / s.page_size;
+                        const size_t prow = (size_t) pages * s.n_head_kv * s.page_size;   // staged rows in use
+                        if (m.stage.k_q) {
+                            cudaMemcpyPeerAsync(P.stage.k_q, P.dev, m.stage.k_q, prevd, prow * s.head_dim, ps);
+                            cudaMemcpyPeerAsync(P.stage.v_q, P.dev, m.stage.v_q, prevd, prow * s.head_dim, ps);
+                            cudaMemcpyPeerAsync(P.stage.k_scale, P.dev, m.stage.k_scale, prevd, prow * (s.head_dim / 64) * 2, ps);
+                            cudaMemcpyPeerAsync(P.stage.v_scale, P.dev, m.stage.v_scale, prevd, prow * (s.head_dim / 64) * 2, ps);
+                        } else {
+                            cudaMemcpyPeerAsync(P.stage.k_pool, P.dev, m.stage.k_pool, prevd, prow * s.head_dim * 2, ps);
+                            cudaMemcpyPeerAsync(P.stage.v_pool, P.dev, m.stage.v_pool, prevd, prow * s.head_dim * 2, ps);
+                        }
+                        cudaMemcpyPeerAsync(P.pooled, P.dev, st.idx_pooled, prevd, (size_t) st.idx_pooled_rows * s.idx_dim * 4, ps);
+                        cudaMemcpyPeerAsync(P.dead, P.dev, st.idx_dead, prevd, (size_t) s.idx_dim * 4, ps);
+                        cudaMemcpyPeerAsync(P.q, P.dev, m.q + Tq * ZV, prevd, (size_t) nq * ZV * 4, ps);
+                        cudaMemcpyPeerAsync(P.qidx, P.dev, m.q_idx + Tq * 512, prevd, (size_t) nq * 512 * 4, ps);
+                        cudaMemcpyPeerAsync(P.steps, P.dev, m.steps_dev + Tq * strata::kernels::kStepCount, prevd,
+                                            (size_t) nq * strata::kernels::kStepCount * 4, ps);
+                        pe.mark(kPeQsaSel, ps);
+                        for (int64_t t0 = 0; t0 < nq; t0 += m.sel_batch) {
+                            const int64_t nb = std::min(m.sel_batch, nq - t0);
+                            const int32_t* steps0 = P.steps + t0 * strata::kernels::kStepCount;
+                            strata::kernels::qsa_block_scores(P.pooled, P.dead, P.qidx + t0 * 512, steps0, nb,
+                                                              m.max_blocks, s, P.scores, ps);
+                            strata::kernels::qsa_block_topk(P.scores, steps0, nb, m.max_blocks, m.cap, s,
+                                                            P.sel + t0 * m.cap, ps);
+                        }
+                        pe.mark(kPeQsaAttn, ps);
+                        const strata::kernels::QsaAttnPools ppools = pools_of(P.stage, P.qident);
+                        for (int64_t t0 = 0; t0 < nq; t0 += m.attn_batch) {
+                            const int64_t nb = std::min(m.attn_batch, nq - t0);
+                            strata::kernels::qsa_decode_attn_batch(P.q + t0 * ZV, ppools, P.sel + t0 * m.cap,
+                                                                   P.steps + t0 * strata::kernels::kStepCount, m.cap, s,
+                                                                   P.ascratch, P.attn + t0 * ZV, nb, ps);
+                        }
+                        pe.mark(kPeQsaOut, ps);
+                        cudaMemcpyPeerAsync(m.attn + Tq * ZV, prevd, P.attn, P.dev, (size_t) nq * ZV * 4, ps);
+                        cudaEventRecord(P.ev_q_done, ps);
+                        pe.mark(kPeIdle, ps);
+                        cudaSetDevice(prevd);
+                        ++P.qsa_layers;
+                        P.qsa_queries += nq;
+                    }
+                    for (int64_t t0 = 0; t0 < Tq; t0 += m.sel_batch) {
+                        const int64_t nb = std::min(m.sel_batch, Tq - t0);
                         const int32_t* steps0 = m.steps_dev + t0 * strata::kernels::kStepCount;
                         // C-1: the grid reaches the batch's last query's n_bid (they rise with the position)
                         const int64_t active = (int64_t) m.steps_host[(size_t) ((t0 + nb - 1) * strata::kernels::kStepCount +
@@ -1746,14 +1858,18 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    if (old_attn || !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
-                                                                            m.attn, T, m.cs))
-                        for (int64_t t0 = 0; t0 < T; t0 += m.attn_batch) {
-                            const int64_t nb = std::min(m.attn_batch, T - t0);
+                    // multi-GPU: with the QSA query split the peer attends for the queries [Tq, T) with the decode
+                    // kernel; the primary keeps the same kernel for its share [0, Tq)
+                    if (old_attn || Tq < T ||
+                        !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
+                                                                m.attn, Tq, m.cs))
+                        for (int64_t t0 = 0; t0 < Tq; t0 += m.attn_batch) {
+                            const int64_t nb = std::min(m.attn_batch, Tq - t0);
                             strata::kernels::qsa_decode_attn_batch(m.q + t0 * ZV, pools, m.sel_ids + t0 * m.cap,
                                                                    m.steps_dev + t0 * strata::kernels::kStepCount, m.cap,
                                                                    s, m.attn_scratch, m.attn + t0 * ZV, nb, m.cs);
                         }
+                    if (Tq < T) cudaStreamWaitEvent(m.cs, m.pp->ev_q_done, 0);   // multi-GPU: the peer's attention rows
                     if (st.kv_q4 || st.kv_hybrid) strata::kernels::fwht256_inplace_cuda(m.attn, T * 24, m.cs);
                     pt.mark(kPfQsa, cs);
                     gate_attn(m.attn, m.Qf, m.attn_h, T, m.cs);

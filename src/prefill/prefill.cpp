@@ -1728,13 +1728,24 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                         for (int64_t t0 = 0; t0 < nq; t0 += m.sel_batch) {
                             const int64_t nb = std::min(m.sel_batch, nq - t0);
                             const int32_t* steps0 = P.steps + t0 * strata::kernels::kStepCount;
-                            strata::kernels::qsa_block_scores(P.pooled, P.dead, P.qidx + t0 * 512, steps0, nb,
-                                                              m.max_blocks, s, P.scores, ps);
+                            // the same scores kernel as the primary (tensor cores unless STRATA_SELECT_OLD): per query the
+                            // same arithmetic, so the split does not change a selection
+                            const int64_t active = (int64_t) m.steps_host[(size_t) ((Tq + t0 + nb - 1) * strata::kernels::kStepCount +
+                                                                                    strata::kernels::kStepNBid)] + 1;
+                            if (std::getenv("STRATA_SELECT_OLD") != nullptr ||
+                                !strata::kernels::qsa_block_scores_tc(P.pooled, P.dead, P.qidx + t0 * 512, steps0, nb,
+                                                                      m.max_blocks, s, P.scores, ps, active))
+                                strata::kernels::qsa_block_scores(P.pooled, P.dead, P.qidx + t0 * 512, steps0, nb,
+                                                                  m.max_blocks, s, P.scores, ps, active);
                             strata::kernels::qsa_block_topk(P.scores, steps0, nb, m.max_blocks, m.cap, s,
                                                             P.sel + t0 * m.cap, ps);
                         }
                         pe.mark(kPeQsaAttn, ps);
                         const strata::kernels::QsaAttnPools ppools = pools_of(P.stage, P.qident);
+                        // D-1's tensor-core attention (one block per query and KV head: a query's rows do not depend
+                        // on which other queries share the launch), the decode kernel where the primary uses it too
+                        if (std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr ||
+                            !strata::kernels::qsa_prompt_attn_batch(P.q, ppools, P.sel, P.steps, m.cap, s, P.attn, nq, ps))
                         for (int64_t t0 = 0; t0 < nq; t0 += m.attn_batch) {
                             const int64_t nb = std::min(m.attn_batch, nq - t0);
                             strata::kernels::qsa_decode_attn_batch(P.q + t0 * ZV, ppools, P.sel + t0 * m.cap,
@@ -1858,9 +1869,8 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     // decode kernel, 32 queries at a time (K8V4 runs the tensor kernel's mode 3: INT8 K,
                     // V dequantized from its q4_0 blocks to fp16 at gather)
                     static const bool old_attn = std::getenv("STRATA_PROMPT_ATTN_OLD") != nullptr;
-                    // multi-GPU: with the QSA query split the peer attends for the queries [Tq, T) with the decode
-                    // kernel; the primary keeps the same kernel for its share [0, Tq)
-                    if (old_attn || Tq < T ||
+                    // multi-GPU: with the QSA query split the peer attends for the queries [Tq, T) with the same kernel
+                    if (old_attn ||
                         !strata::kernels::qsa_prompt_attn_batch(m.q, pools, m.sel_ids, m.steps_dev, m.cap, s,
                                                                 m.attn, Tq, m.cs))
                         for (int64_t t0 = 0; t0 < Tq; t0 += m.attn_batch) {

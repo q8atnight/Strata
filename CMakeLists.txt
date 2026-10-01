@@ -97,7 +97,7 @@ if(STRATA_ENABLE_CUDA)
   endforeach()
   message(STATUS "Strata: CUDA enabled, arch ${CMAKE_CUDA_ARCHITECTURES}")
   set(_strata_gpu_runtime_target CUDA::cudart)
-  set(_strata_gpu_blas_target CUDA::cublas)
+  set(_strata_gpu_blas_target CUDA::cublas CUDA::cublasLt)   # P1: cublasLt for the split-K-free half products
   set(_strata_gpu_include_directories ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
 elseif(STRATA_ENABLE_HIP)
   set(_strata_gpu_runtime_target strata_hip_runtime)

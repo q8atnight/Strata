@@ -319,12 +319,25 @@ struct PeerPrefill {
     cudaEvent_t ev_q = nullptr;       // on the primary: K/V, indexer and queries ready
     cudaEvent_t ev_q_done = nullptr;  // on the peer: its attention rows are in the primary's buffer
     int64_t qsa_layers = 0, qsa_queries = 0;
+    // P1 (STRATA_PF_GDN_SPLIT=1): the peer runs half of every GDN layer's heads (q/k heads 8-15 and their 24 v heads)
+    // in passes of gdn_sub tokens: projections from the PRIMARY's weights over P2P, conv + recurrence on the primary's
+    // state and history in place, y16 straight into the primary's y_h; the primary keeps the other half + ssm_out.
+    bool gdn = false;
+    int64_t gdn_sub = 0, gdn_layers = 0;
+    uint16_t* gx = nullptr;                 // the chunk's mixed_h (aliases `mixed`: the MoE half runs later on P.s)
+    float *gqkv = nullptr, *ghbuf = nullptr, *gz = nullptr, *ggate = nullptr, *gbeta = nullptr, *gw = nullptr,
+          *ggamma = nullptr;
+    std::unique_ptr<Gemm> ggemm;
+    cudaEvent_t ev_gin = nullptr, ev_ggates = nullptr;   // on the primary: mixed_h ready / gate+beta ready
+    cudaEvent_t ev_gdone = nullptr;                      // on the peer: its half is in the primary's y_h and state
     ~PeerPrefill() {
         if (dev < 0) return;
         int prev = 0;
         cudaGetDevice(&prev);
         cudaSetDevice(dev);
         if (s) cudaStreamSynchronize(s);
+        ggemm.reset();
+        if (ev_gdone) cudaEventDestroy(ev_gdone);
         ctx.reset();
         for (void* p : owned) cudaFree(p);
         if (ev_done) cudaEventDestroy(ev_done);
@@ -341,6 +354,8 @@ struct PeerPrefill {
         cudaSetDevice(prev);
         if (ev_in) cudaEventDestroy(ev_in);
         if (ev_q) cudaEventDestroy(ev_q);
+        if (ev_gin) cudaEventDestroy(ev_gin);
+        if (ev_ggates) cudaEventDestroy(ev_ggates);
     }
 };
 
@@ -1037,6 +1052,33 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
                      cudaEventCreateWithFlags(&pp->ev_q_done, cudaEventDisableTiming) == cudaSuccess;
         pp->qsa = ok;
     }
+    {   // P1: half of the GDN heads on the peer
+        const char* gv = std::getenv("STRATA_PF_GDN_SPLIT");
+        if (ok && gv != nullptr && std::atoi(gv) != 0) {
+            const char* sv = std::getenv("STRATA_PF_GDN_SUB");
+            pp->gdn_sub = std::max<int64_t>(64, std::min<int64_t>(m.T_max, sv ? std::atoll(sv) : 2048));
+            const int64_t Ts = pp->gdn_sub;
+            pp->gx = (uint16_t*) pp->mixed;
+            pp->gqkv = (float*) take((size_t) Ts * (C / 2) * 4);
+            pp->ghbuf = (float*) take((size_t) Ts * (C / 2) * 4);
+            pp->gz = (float*) take((size_t) Ts * (ZV / 2) * 4);
+            pp->ggate = (float*) take((size_t) Ts * HV * 4);
+            pp->gbeta = (float*) take((size_t) Ts * HV * 4);
+            pp->gw = (float*) take((size_t) C * 4 * 4);
+            pp->ggamma = (float*) take(128 * 4);
+            const size_t gws = 32u << 20;   // the primary's GEMM workspace size: the same cuBLAS heuristics
+            // the peer's half of attn_qkv (5120 rows) and attn_gate (3072 rows), dequantized once per layer
+            uint16_t* gsc = (uint16_t*) take((size_t) (C / 2 + ZV / 2) * N * 2);
+            void* gwk = take(gws);
+            if (ok) {
+                pp->ggemm = std::make_unique<Gemm>();
+                std::string ge;
+                ok = pp->ggemm->init_external(pp->s, gsc, (C / 2 + ZV / 2) * N, gwk, gws, ge) &&
+                     cudaEventCreateWithFlags(&pp->ev_gdone, cudaEventDisableTiming) == cudaSuccess;
+            }
+            pp->gdn = ok;
+        }
+    }
     if (ok) {
         pp->ctx = std::make_unique<mmq::Context>();
         mmq::iota(pp->ident, pp->cap_rows, pp->s);
@@ -1046,6 +1088,12 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
     cudaMemGetInfo(&fb, &tb);
     cudaSetDevice(prev);
     if (!ok) { err = "prefill peer: the peer's buffers do not fit (raise --peer-reserve-mib or lower --peer-prefill-rows)"; return false; }
+    if (pp->gdn && (cudaEventCreateWithFlags(&pp->ev_gin, cudaEventDisableTiming) != cudaSuccess ||
+                    cudaEventCreateWithFlags(&pp->ev_ggates, cudaEventDisableTiming) != cudaSuccess)) {
+        err = "prefill peer: event"; return false;
+    }
+    if (pp->gdn) std::fprintf(stderr, "strata prefill: P1 GDN split - the peer runs q/k heads 8-15 and their 24 v heads of every "
+                                      "GDN layer in %lld-token passes\n", (long long) pp->gdn_sub);
     std::fprintf(stderr, "strata prefill: peer GPU %d computes its experts' rows of each prompt chunk (up to %lld rows per "
                          "layer%s)%s; %zu MiB left free on it\n", pp->dev, (long long) pp->cap_rows,
                  pp->compact ? (pp->ps_frac > 0.0 ? (", compact group buffers, streams " + std::to_string((int) (pp->ps_frac * 100 + 0.5)) +
@@ -1163,8 +1211,9 @@ struct PfTimer {
     }
 };
 // multi-GPU: the peer's own timeline (STRATA_PREFILL_TIMING): marks on the peer stream, folded with the primary's
-enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeQsaIn, kPeQsaSel, kPeQsaAttn, kPeQsaOut, kPeCount };
-const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out", "qsa in", "qsa select", "qsa attn", "qsa out"};
+enum PePhase { kPeIdle, kPeMoeIn, kPeMoeGemm, kPeMoeOut, kPeQsaIn, kPeQsaSel, kPeQsaAttn, kPeQsaOut, kPeGdnIn, kPeGdn, kPeCount };
+const char* const kPeNames[kPeCount] = {"idle", "moe in", "moe gemm", "moe out", "qsa in", "qsa select", "qsa attn", "qsa out",
+                                        "gdn in", "gdn"};
 struct PeTimer {
     bool on = std::getenv("STRATA_PREFILL_TIMING") != nullptr;
     int dev = -1;
@@ -1607,6 +1656,110 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdn, cs);
                     float* state = ss.gdn_state + (size_t) (gdn_index - ss.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
+                    static const int gdn_dbg = [] { const char* v = std::getenv("STRATA_PF_GDN_DBG"); return v ? std::atoi(v) : 0; }();
+                    static const bool gdn_dbg_full = std::getenv("STRATA_PF_GDN_DBG_FULL") != nullptr;
+                    if (gdn_dbg == 1 && T >= 512 && wqkv->native_data && wg->native_data) {
+                        // debug: both halves HERE with the half kernels and row-run products (no peer)
+                        constexpr int64_t SS = 128, HQ = 16, H8 = 8;
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        for (int hb = 0; hb < 2; ++hb) {
+                            const int64_t base = hb * H8;
+                            int64_t qr0[5], qrn[5], zr0[3], zrn[3];
+                            qr0[0] = base * SS; qr0[1] = HQ * SS + base * SS;
+                            for (int g3 = 0; g3 < 3; ++g3) { qr0[2 + g3] = 2 * HQ * SS + (g3 * HQ + base) * SS; zr0[g3] = (g3 * HQ + base) * SS; }
+                            for (int i = 0; i < 5; ++i) qrn[i] = H8 * SS;
+                            for (int i = 0; i < 3; ++i) zrn[i] = H8 * SS;
+                            if (gdn_dbg_full) {   // the full products (the original shapes), then the half's columns
+                                if (!native_proj(m.gemm, wqkv, m.mixed_h, m.hbuf, T, v.name("attn_qkv.weight"), err)) return false;
+                                if (!native_proj(m.gemm, wg, m.mixed_h, m.y, T, v.name("attn_gate.weight"), err)) return false;
+                                int64_t at = 0;
+                                for (int i = 0; i < 5; ++i) {
+                                    cudaMemcpy2DAsync(m.qkv + at, (C / 2) * 4, m.hbuf + qr0[i], C * 4, qrn[i] * 4, T,
+                                                      cudaMemcpyDeviceToDevice, m.cs);
+                                    at += qrn[i];
+                                }
+                                at = 0;
+                                for (int i = 0; i < 3; ++i) {
+                                    cudaMemcpy2DAsync(m.z + at, (ZV / 2) * 4, m.y + zr0[i], ZV * 4, zrn[i] * 4, T,
+                                                      cudaMemcpyDeviceToDevice, m.cs);
+                                    at += zrn[i];
+                                }
+                            } else {
+                            m.gemm.native_runs(m.mixed_h, wqkv->native_type, wqkv->native_data, qr0, qrn, 5, m.qkv, T, N, C / 2, C);
+                            m.gemm.native_runs(m.mixed_h, wg->native_type, wg->native_data, zr0, zrn, 3, m.z, T, N, ZV / 2, ZV);
+                            }
+                            gdn_conv_half(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, (int) base, m.cs);
+                            gdn_recurrence_half(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h,
+                                                ZV, true, (int) base, T, m.cs);
+                        }
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                        ++gdn_index;
+                    } else if (m.pp && m.pp->gdn && T >= 512 && wqkv->native_data && wg->native_data) {
+                        // P1: half the heads on the peer (base 8), half here (base 0); ssm_out over all of y_h here
+                        PeerPrefill& P = *m.pp;
+                        constexpr int64_t SS = 128, HQ = 16, H8 = 8;
+                        int64_t qr0[2][5], qrn[5], zr0[2][3], zrn[3];
+                        for (int hb = 0; hb < 2; ++hb) {
+                            const int64_t base = hb * H8;
+                            qr0[hb][0] = base * SS; qr0[hb][1] = HQ * SS + base * SS;
+                            for (int g3 = 0; g3 < 3; ++g3) {
+                                qr0[hb][2 + g3] = 2 * HQ * SS + (g3 * HQ + base) * SS;
+                                zr0[hb][g3] = (g3 * HQ + base) * SS;
+                            }
+                        }
+                        for (int i = 0; i < 5; ++i) qrn[i] = H8 * SS;
+                        for (int i = 0; i < 3; ++i) zrn[i] = H8 * SS;
+                        cudaEventRecord(P.ev_gin, m.cs);   // mixed_h ready; the previous chunk's state complete
+                        if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
+                        if (!bf16_proj(m.gemm, wb, m.mixed_bf, m.ab + HV, T, v.name("ssm_beta.weight"), err, 2 * HV)) return false;
+                        gdn_gates(m.ab, (const float*) wdt->data, (const float*) wsa->data, m.gate, m.beta, T, m.cs);
+                        cudaEventRecord(P.ev_ggates, m.cs);
+                        {   // the peer's half (enqueued before the primary waits for it)
+                            int prevd = 0;
+                            cudaGetDevice(&prevd);
+                            cudaSetDevice(P.dev);
+                            const cudaStream_t ps = P.s;
+                            cudaStreamWaitEvent(ps, P.ev_gin, 0);
+                            pe.mark(kPeGdnIn, ps);
+                            cudaMemcpyPeerAsync(P.gx, P.dev, m.mixed_h, prevd, (size_t) T * N * 2, ps);
+                            cudaMemcpyPeerAsync(P.gw, P.dev, wc->data, prevd, (size_t) C * 4 * 4, ps);
+                            cudaMemcpyPeerAsync(P.ggamma, P.dev, wnm->data, prevd, 128 * 4, ps);
+                            pe.mark(kPeGdn, ps);
+                            bool gates = false;
+                            uint16_t* wq16 = P.ggemm->scratch();
+                            uint16_t* wz16 = wq16 + (C / 2) * N;
+                            P.ggemm->dequant_runs(wqkv->native_type, wqkv->native_data, qr0[1], qrn, 5, N, wq16);
+                            P.ggemm->dequant_runs(wg->native_type, wg->native_data, zr0[1], zrn, 3, N, wz16);
+                            for (int64_t t0 = 0; t0 < T; t0 += P.gdn_sub) {
+                                const int64_t nt = std::min(P.gdn_sub, T - t0);
+                                P.ggemm->f16_exact(P.gx + t0 * N, wq16, P.gqkv, nt, C / 2, N, C / 2, T, C);
+                                P.ggemm->f16_exact(P.gx + t0 * N, wz16, P.gz, nt, ZV / 2, N, ZV / 2, T, ZV);
+                                gdn_conv_half(conv, P.gqkv, P.gw, P.ghbuf, nt, EPS, (int) H8, ps);
+                                if (!gates) { cudaStreamWaitEvent(ps, P.ev_ggates, 0); gates = true; }
+                                cudaMemcpyPeerAsync(P.ggate, P.dev, m.gate + t0 * HV, prevd, (size_t) nt * HV * 4, ps);
+                                cudaMemcpyPeerAsync(P.gbeta, P.dev, m.beta + t0 * HV, prevd, (size_t) nt * HV * 4, ps);
+                                gdn_recurrence_half(state, P.ghbuf, P.ggate, P.gbeta, P.gz, P.ggamma, EPS, P.gqkv,
+                                                    m.y_h + t0 * ZV, ZV, true, (int) H8, nt, ps);
+                            }
+                            cudaEventRecord(P.ev_gdone, ps);
+                            pe.mark(kPeIdle, ps);
+                            cudaSetDevice(prevd);
+                            ++P.gdn_layers;
+                        }
+                        m.gemm.native_runs(m.mixed_h, wqkv->native_type, wqkv->native_data, qr0[0], qrn, 5, m.qkv, T, N, C / 2, C);
+                        m.gemm.native_runs(m.mixed_h, wg->native_type, wg->native_data, zr0[0], zrn, 3, m.z, T, N, ZV / 2, ZV);
+                        pt.mark(kPfGdnConv, cs);
+                        gdn_conv_half(conv, m.qkv, (const float*) wc->data, m.hbuf, T, EPS, 0, m.cs);
+                        pt.mark(kPfGdnRec, cs);
+                        gdn_recurrence_half(state, m.hbuf, m.gate, m.beta, m.z, (const float*) wnm->data, EPS, m.y, m.y_h,
+                                            ZV, true, 0, T, m.cs);
+                        pt.mark(kPfGdnOut, cs);
+                        cudaStreamWaitEvent(m.cs, P.ev_gdone, 0);   // the peer's y_h columns and state
+                        if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
+                        ++gdn_index;
+                    } else {
                     if (!native_proj(m.gemm, wqkv, m.mixed_h, m.qkv, T, v.name("attn_qkv.weight"), err)) return false;
                     if (!native_proj(m.gemm, wg, m.mixed_h, m.z, T, v.name("attn_gate.weight"), err)) return false;
                     if (!bf16_proj(m.gemm, wa, m.mixed_bf, m.ab, T, v.name("ssm_alpha.weight"), err, 2 * HV)) return false;
@@ -1619,6 +1772,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                     pt.mark(kPfGdnOut, cs);
                     if (!native_proj(m.gemm, wo, m.y_h, m.bo, T, v.name("ssm_out.weight"), err)) return false;
                     ++gdn_index;
+                    }
                 } else if (half == 0) {
                     // ======================= QSA =======================
                     const core::QsaState& st = ss.qsa_states[qsa_index];

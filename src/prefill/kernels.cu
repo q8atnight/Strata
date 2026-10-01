@@ -415,6 +415,138 @@ __global__ void __launch_bounds__(S) gdn_out_norm_kernel(const float* __restrict
     y16[at] = hf(v);
 }
 
+// ---------------------------------------------------------------- GDN, one half of the heads (P1, multi-GPU)
+// The heads split by q/k head: half "base" (0 or 8) owns q/k heads [base, base+8) and the 24 v heads h with
+// h % 16 in that range ({base..base+7, base+16.., base+32..}); both cards run the same per-head arithmetic as the
+// kernels above on COMPACT buffers (q 8x128 | k 8x128 | v 24x128 = 5120 channels per token, z/oc 24x128), while the
+// state, the conv history, the gates and the weights keep the full layout (indexed by the global head/channel).
+constexpr int HKH = HK / 2, HVH = HV / 2, CH = C / 2;
+__device__ __forceinline__ int gdn_half_vhead(int j, int base) { return (j / HKH) * HK + base + (j % HKH); }
+__device__ __forceinline__ int gdn_half_channel(int cl, int base) {
+    if (cl < HKH * S) return base * S + cl;
+    if (cl < 2 * HKH * S) return HK * S + base * S + (cl - HKH * S);
+    const int j = (cl - 2 * HKH * S) / S, d = (cl - 2 * HKH * S) % S;
+    return 2 * HK * S + gdn_half_vhead(j, base) * S + d;
+}
+__global__ void gdn_conv_tiled_half_kernel(const float* __restrict__ hist, const float* __restrict__ qkv,
+                                           const float* __restrict__ w, float* __restrict__ h, int64_t T, int base) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= CH) return;
+    const int cg = gdn_half_channel(c, base);
+    const int64_t t0 = (int64_t) blockIdx.y * CONV_TILE;
+    if (t0 >= T) return;
+    const int64_t t1 = t0 + CONV_TILE < T ? t0 + CONV_TILE : T;
+    auto input = [&](int64_t t) -> float { return t >= 0 ? qkv[t * CH + c] : hist[cg * 3 + (int) (t + 3)]; };
+    float v0 = input(t0 - 3), v1 = input(t0 - 2), v2 = input(t0 - 1);
+    const float w0 = w[cg * 4], w1 = w[cg * 4 + 1], w2 = w[cg * 4 + 2], w3 = w[cg * 4 + 3];
+    for (int64_t t = t0; t < t1; ++t) {
+        const float x = qkv[t * CH + c];
+        const float s = v0 * w0 + v1 * w1 + v2 * w2 + x * w3;
+        h[t * CH + c] = s / (1.0f + __expf(-s));
+        v0 = v1; v1 = v2; v2 = x;
+    }
+}
+__global__ void gdn_conv_hist_half_kernel(float* __restrict__ hist, const float* __restrict__ qkv, int64_t T, int base) {
+    const int c = blockIdx.x * blockDim.x + threadIdx.x;
+    if (c >= CH) return;
+    const int cg = gdn_half_channel(c, base);
+    float v[3];
+    for (int k = 0; k < 3; ++k) {
+        const int64_t t = T - 3 + k;
+        v[k] = t >= 0 ? qkv[t * CH + c] : hist[cg * 3 + (int) (t + 3)];
+    }
+    hist[cg * 3] = v[0]; hist[cg * 3 + 1] = v[1]; hist[cg * 3 + 2] = v[2];
+}
+__global__ void gdn_l2_half_kernel(float* __restrict__ h, float eps) {
+    // block (t, head) over the half's 16 q/k heads, 128 threads - the same reduction as gdn_l2_kernel
+    const int64_t t = blockIdx.y;
+    const int head = blockIdx.x;
+    float* x = h + t * CH + head * S;
+    const float v = x[threadIdx.x];
+    float sq = warp_sum(v * v);
+    __shared__ float part[4];
+    if ((threadIdx.x & 31) == 0) part[threadIdx.x >> 5] = sq;
+    __syncthreads();
+    const float ss = part[0] + part[1] + part[2] + part[3];
+    x[threadIdx.x] = v * rsqrtf(ss + eps);
+}
+// gdn_rec_cols_pipe_kernel for the half's 24 v heads: the same loads, arithmetic and order per (head, column)
+__global__ void __launch_bounds__(CB * RG) gdn_rec_half_kernel(float* __restrict__ state, const float* __restrict__ h,
+                                                                const float* __restrict__ gate,
+                                                                const float* __restrict__ beta,
+                                                                float* __restrict__ oc_out, int64_t T, int base) {
+    constexpr int NT = CB * RG, LPT = S / NT;
+    __shared__ float sk[S], sq[S], red[RG][CB];
+    const int j = blockIdx.x / NCB, cb = blockIdx.x % NCB;
+    const int head = gdn_half_vhead(j, base);
+    const int c = threadIdx.x, rg = threadIdx.y, tid = rg * CB + c, col = cb * CB + c;
+    const int qh = j % HKH;
+    float s[RPG];
+    float* sbase = state + ((size_t) (rg * RPG) * HV + head) * S + col;
+    const size_t rs = (size_t) HV * S;
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) s[r] = sbase[r * rs];
+    float nq[LPT], nk[LPT], nv = 0.0f, ng = 0.0f, nb = 0.0f;
+    auto fetch = [&](int64_t t) {
+        const float* ht = h + t * CH;
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { nq[u] = ht[qh * S + tid + u * NT]; nk[u] = ht[HKH * S + qh * S + tid + u * NT]; }
+        nv = ht[2 * HKH * S + j * S + col];
+        ng = gate[t * HV + head];
+        nb = beta[t * HV + head];
+    };
+    if (T > 0) fetch(0);
+    for (int64_t t = 0; t < T; ++t) {
+        float cq[LPT], ck[LPT];
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { cq[u] = nq[u]; ck[u] = nk[u]; }
+        const float cv = nv, cg = ng, cbt = nb;
+        __syncthreads();
+#pragma unroll
+        for (int u = 0; u < LPT; ++u) { sq[tid + u * NT] = cq[u]; sk[tid + u * NT] = ck[u]; }
+        __syncthreads();
+        if (t + 1 < T) fetch(t + 1);
+        const float g = __expf(cg);
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) kv = fmaf(s[r], sk[rg * RPG + r], kv);
+        red[rg][c] = kv;
+        __syncthreads();
+        const float kv_col = red[0][c] + red[1][c] + red[2][c] + red[3][c];
+        const float delta = (cv - g * kv_col) * cbt;
+        float o = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPG; ++r) {
+            s[r] = fmaf(g, s[r], sk[rg * RPG + r] * delta);
+            o = fmaf(s[r], sq[rg * RPG + r], o);
+        }
+        __syncthreads();
+        red[rg][c] = o;
+        __syncthreads();
+        if (rg == 0) oc_out[t * HVH * S + j * S + col] = (red[0][c] + red[1][c] + red[2][c] + red[3][c]) * rsqrtf((float) S);
+    }
+#pragma unroll
+    for (int r = 0; r < RPG; ++r) sbase[r * rs] = s[r];
+}
+// gdn_out_norm_kernel for the half: y16 either at the global head (row pitch `pitch`) or compact (local head)
+__global__ void __launch_bounds__(S) gdn_out_norm_half_kernel(const float* __restrict__ oc_in, const float* __restrict__ z,
+                                                              const float* __restrict__ gamma, float eps,
+                                                              uint16_t* __restrict__ y16, int64_t pitch, int global,
+                                                              int base) {
+    __shared__ float wsum[4];
+    const int64_t t = blockIdx.x;
+    const int j = blockIdx.y, col = threadIdx.x;
+    const size_t at = (size_t) t * HVH * S + (size_t) j * S + col;
+    const float oc = oc_in[at];
+    float sp = warp_sum(oc * oc);
+    if ((col & 31) == 0) wsum[col >> 5] = sp;
+    __syncthreads();
+    const float ss = wsum[0] + wsum[1] + wsum[2] + wsum[3];
+    const float v = oc * rsqrtf(ss / (float) S + eps) * gamma[col] * sigm(z[at]);
+    const int hh = global ? gdn_half_vhead(j, base) : j;
+    y16[(size_t) t * pitch + (size_t) hh * S + col] = hf(v);
+}
+
 // ---------------------------------------------------------------- MoE
 template <int REG>
 __global__ void route_kernel(const float* __restrict__ logits, int32_t* __restrict__ ids, float* __restrict__ wout,
@@ -707,6 +839,24 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
         gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16);
     }
     check("gdn_recurrence");
+}
+void gdn_conv_half(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, int base,
+                   void* stream) {
+    if (T <= 0) return;
+    gdn_conv_tiled_half_kernel<<<dim3(CH / 128, (unsigned) ((T + CONV_TILE - 1) / CONV_TILE)), 128, 0,
+                                 (cudaStream_t) stream>>>(history, qkv, conv_w, h, T, base);
+    gdn_conv_hist_half_kernel<<<CH / 128, 128, 0, (cudaStream_t) stream>>>(history, qkv, T, base);
+    gdn_l2_half_kernel<<<dim3(2 * HKH, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
+    check("gdn_conv_half");
+}
+void gdn_recurrence_half(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                         const float* gamma, float eps, float* oc, uint16_t* y16, int64_t y16_pitch, bool y16_global,
+                         int base, int64_t T, void* stream) {
+    if (T <= 0) return;
+    gdn_rec_half_kernel<<<HVH * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, oc, T, base);
+    gdn_out_norm_half_kernel<<<dim3((unsigned) T, HVH), S, 0, (cudaStream_t) stream>>>(oc, z, gamma, eps, y16, y16_pitch,
+                                                                                       y16_global ? 1 : 0, base);
+    check("gdn_recurrence_half");
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)

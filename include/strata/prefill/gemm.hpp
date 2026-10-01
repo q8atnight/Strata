@@ -37,6 +37,23 @@ public:
     void native(const uint16_t* X, int ggml_type, const void* W_blocks, float* Y, int64_t T, int64_t N, int64_t K,
                 int64_t ldy = 0, float beta = 0.0f);
 
+    /// P1: the same for a SUBSET of W's rows, given as `nruns` ranges [r0, r0 + rows): each range is dequantized
+    /// into consecutive rows of the scratch and one product writes Y's columns in run order (Y[T, sum rows]).
+    void native_runs(const uint16_t* X, int ggml_type, const void* W_blocks, const int64_t* r0, const int64_t* rows,
+                     int nruns, float* Y, int64_t T, int64_t K, int64_t ldy, int64_t N_ref);
+
+    /// P1: only the dequantization of native_runs, into `dst` (FP16, rows in run order).
+    void dequant_runs(int ggml_type, const void* W_blocks, const int64_t* r0, const int64_t* rows, int nruns,
+                      int64_t K, uint16_t* dst);
+
+    /// P1: Y = X . W^T in FP16 like f16, for a SUBSET of a bigger weight's rows, with the same bits the full product
+    /// [T_ref tokens x N_ref rows] gives: cuBLAS' K order depends only on the split-K factor and the reduction
+    /// scheme (measured: every tensor-core kernel with the same split gives the same bits; GemmEx picks split-K 2 for
+    /// N=6144 and none for N=10240 at T=8192, and other ones for the subsets) - so the subset takes a cublasLt
+    /// algorithm with the split the full shape's first heuristic choice has (= what GemmEx runs, measured).
+    void f16_exact(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                   int64_t T_ref, int64_t N_ref);
+
     /// Caller-owned buffers only: the scratch and workspace moved (the prompt path laid its buffers out again).
     void rebind(uint16_t* scratch, int64_t scratch_elems, void* workspace, size_t ws_bytes);
 
@@ -52,6 +69,8 @@ private:
     void* workspace_ = nullptr;
     bool external_ = false;
     void* hipblaslt_state_ = nullptr;
+    void* lt_ = nullptr;      // P1: cublasLt handle (created on first use)
+    void* lt_cache_ = nullptr;
 };
 
 

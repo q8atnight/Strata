@@ -4,6 +4,11 @@
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
+#if !defined(__HIPCC__)
+#include <cublasLt.h>
+#include <map>
+#include <tuple>
+#endif
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -276,6 +281,10 @@ Gemm::~Gemm() {
     delete static_cast<HipLtState*>(hipblaslt_state_);
 #endif
     if (handle_) cublasDestroy((cublasHandle_t) handle_);
+#if !defined(__HIPCC__)
+    delete static_cast<std::map<std::tuple<int64_t, int64_t, int64_t, int64_t>, cublasLtMatmulAlgo_t>*>(lt_cache_);
+    if (lt_) cublasLtDestroy((cublasLtHandle_t) lt_);
+#endif
     if (!external_) {
         if (scratch_) cudaFree(scratch_);
         if (workspace_) cudaFree(workspace_);
@@ -388,6 +397,110 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
     }
     strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, scratch_, stream_);
     f16(X, scratch_, Y, T, N, K, ldy, beta);
+}
+
+void Gemm::native_runs(const uint16_t* X, int ggml_type, const void* W_blocks, const int64_t* r0, const int64_t* rows,
+                       int nruns, float* Y, int64_t T, int64_t K, int64_t ldy, int64_t N_ref) {
+    int64_t n = 0;
+    for (int i = 0; i < nruns; ++i) n += rows[i];
+    if (n * K > scratch_elems_) { std::fprintf(stderr, "prefill gemm: native_runs needs %lld scratch elements\n", (long long) (n * K)); std::exit(1); }
+    int64_t at = 0;
+    for (int i = 0; i < nruns; ++i) {
+        strata::kernels::dequant_f16(ggml_type, W_blocks, r0[i], rows[i], K, scratch_ + at * K, stream_);
+        at += rows[i];
+    }
+    f16_exact(X, scratch_, Y, T, n, K, ldy, T, N_ref);
+}
+
+void Gemm::dequant_runs(int ggml_type, const void* W_blocks, const int64_t* r0, const int64_t* rows, int nruns,
+                        int64_t K, uint16_t* dst) {
+    int64_t at = 0;
+    for (int i = 0; i < nruns; ++i) {
+        strata::kernels::dequant_f16(ggml_type, W_blocks, r0[i], rows[i], K, dst + at * K, stream_);
+        at += rows[i];
+    }
+}
+
+void Gemm::f16_exact(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_t N, int64_t K, int64_t ldy,
+                     int64_t T_ref, int64_t N_ref) {
+    if (T <= 0 || N <= 0) return;
+    if (ldy <= 0) ldy = N;
+#if defined(__HIPCC__)
+    f16(X, W, Y, T, N, K, ldy, 0.0f);
+#else
+    using Key = std::tuple<int64_t, int64_t, int64_t, int64_t, int64_t, int64_t>;
+    using Cache = std::map<Key, cublasLtMatmulAlgo_t>;
+    if (!lt_) {
+        cublasLtHandle_t h = nullptr;
+        if (cublasLtCreate(&h) != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "prefill gemm: cublasLtCreate failed\n"); std::exit(1); }
+        lt_ = h;
+        lt_cache_ = new Cache();
+    }
+    cublasLtHandle_t lt = (cublasLtHandle_t) lt_;
+    const size_t wsb = 32u << 20;
+    struct Desc {
+        cublasLtMatmulDesc_t op = nullptr;
+        cublasLtMatrixLayout_t la = nullptr, lb = nullptr, lc = nullptr;
+        Desc(int64_t t, int64_t n, int64_t k, int64_t ld) {
+            cublasLtMatmulDescCreate(&op, CUBLAS_COMPUTE_32F, CUDA_R_32F);
+            const cublasOperation_t ta = CUBLAS_OP_T, tb = CUBLAS_OP_N;
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSA, &ta, sizeof ta);
+            cublasLtMatmulDescSetAttribute(op, CUBLASLT_MATMUL_DESC_TRANSB, &tb, sizeof tb);
+            cublasLtMatrixLayoutCreate(&la, CUDA_R_16F, (uint64_t) k, (uint64_t) n, k);
+            cublasLtMatrixLayoutCreate(&lb, CUDA_R_16F, (uint64_t) k, (uint64_t) t, k);
+            cublasLtMatrixLayoutCreate(&lc, CUDA_R_32F, (uint64_t) n, (uint64_t) t, ld);
+        }
+        ~Desc() {
+            cublasLtMatrixLayoutDestroy(la); cublasLtMatrixLayoutDestroy(lb); cublasLtMatrixLayoutDestroy(lc);
+            cublasLtMatmulDescDestroy(op);
+        }
+    };
+    auto heur = [&](const Desc& d, cublasLtMatmulHeuristicResult_t* res) {
+        cublasLtMatmulPreference_t pr = nullptr;
+        cublasLtMatmulPreferenceCreate(&pr);
+        cublasLtMatmulPreferenceSetAttribute(pr, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES, &wsb, sizeof wsb);
+        int nr = 0;
+        cublasLtMatmulAlgoGetHeuristic(lt, d.op, d.la, d.lb, d.lc, d.lc, pr, 32, res, &nr);
+        cublasLtMatmulPreferenceDestroy(pr);
+        return nr;
+    };
+    auto split_of = [](const cublasLtMatmulAlgo_t& a, int& sk, int& rs) {
+        size_t sz = 0;
+        sk = 0; rs = 0;
+        cublasLtMatmulAlgoConfigGetAttribute(&a, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &sk, sizeof sk, &sz);
+        cublasLtMatmulAlgoConfigGetAttribute(&a, CUBLASLT_ALGO_CONFIG_REDUCTION_SCHEME, &rs, sizeof rs, &sz);
+        if (sk <= 1) { sk = 1; rs = 0; }
+    };
+    Cache& cache = *static_cast<Cache*>(lt_cache_);
+    const Key key{T, N, K, ldy, T_ref, N_ref};
+    Desc d(T, N, K, ldy);
+    auto it = cache.find(key);
+    if (it == cache.end()) {
+        cublasLtMatmulHeuristicResult_t rf[32], rs_[32];
+        Desc dref(T_ref, N_ref, K, N_ref);
+        const int nf = heur(dref, rf);
+        int want_sk = 1, want_rs = 0;
+        if (nf > 0) split_of(rf[0].algo, want_sk, want_rs);
+        const int ns = heur(d, rs_);
+        int pick = -1;
+        for (int i = 0; i < ns && pick < 0; ++i) {
+            int sk = 0, r = 0;
+            split_of(rs_[i].algo, sk, r);
+            if (rs_[i].state == CUBLAS_STATUS_SUCCESS && sk == want_sk && r == want_rs) pick = i;
+        }
+        if (pick < 0) {
+            std::fprintf(stderr, "prefill gemm: no cublasLt algorithm with split-K %d (reduction %d) for N=%lld T=%lld "
+                                 "(reference N=%lld T=%lld)\n", want_sk, want_rs, (long long) N, (long long) T,
+                         (long long) N_ref, (long long) T_ref);
+            std::exit(1);
+        }
+        it = cache.emplace(key, rs_[pick].algo).first;
+    }
+    const float alpha = 1.0f, beta = 0.0f;
+    const cublasStatus_t st = cublasLtMatmul(lt, d.op, &alpha, W, d.la, X, d.lb, &beta, Y, d.lc, Y, d.lc, &it->second,
+                                             workspace_, wsb, (cudaStream_t) stream_);
+    if (st != CUBLAS_STATUS_SUCCESS) { std::fprintf(stderr, "prefill gemm: cublasLtMatmul failed (%d)\n", (int) st); std::exit(1); }
+#endif
 }
 
 }  // namespace strata::prefill

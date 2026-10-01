@@ -45,6 +45,17 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream);
 
+/// P1 (multi-GPU): the same three steps for one half of the heads - half `base` (0 or 8) owns q/k heads
+/// [base, base+8) and the 24 v heads h with h % 16 in that range.  COMPACT activations: qkv/h [T, 5120]
+/// (q 8x128 | k 8x128 | v 24x128), z/oc [T, 3072]; state, history, gates, conv weights in the FULL layout.  Per head
+/// the same arithmetic in the same order as gdn_conv / gdn_recurrence (the same bits).  y16: at the global head
+/// with row pitch y16_pitch (y16_global) or compact.
+void gdn_conv_half(float* history, const float* qkv, const float* conv_w, float* h, int64_t T, float eps, int base,
+                   void* stream);
+void gdn_recurrence_half(float* state, const float* h, const float* gate, const float* beta, const float* z,
+                         const float* gamma, float eps, float* oc, uint16_t* y16, int64_t y16_pitch, bool y16_global,
+                         int base, int64_t T, void* stream);
+
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream);

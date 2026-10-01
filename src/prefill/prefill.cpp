@@ -327,7 +327,16 @@ struct PeerPrefill {
     uint16_t* gx = nullptr;                 // the chunk's mixed_h (aliases `mixed`: the MoE half runs later on P.s)
     float *gqkv = nullptr, *ghbuf = nullptr, *gz = nullptr, *ggate = nullptr, *gbeta = nullptr, *gw = nullptr,
           *ggamma = nullptr;
+    std::vector<char> gw_have;              // per GDN layer: its conv weights + norm gamma are in gw/ggamma already
     std::unique_ptr<Gemm> ggemm;
+    // P1 pipelining (STRATA_PF_GDN_PIPE, default on): activations in and y16 out per pass on their own copy stream
+    // (y16 into two local compact buffers, copied into the primary's y_h while the next pass computes)
+    bool gpipe = false;
+    cudaStream_t gcp = nullptr;
+    uint16_t* gy16[2] = {};
+    std::vector<cudaEvent_t> ev_xin;
+    cudaEvent_t ev_ycomp[2] = {}, ev_ycopied[2] = {};
+    bool ylive[2] = {};
     cudaEvent_t ev_gin = nullptr, ev_ggates = nullptr;   // on the primary: mixed_h ready / gate+beta ready
     cudaEvent_t ev_gdone = nullptr;                      // on the peer: its half is in the primary's y_h and state
     ~PeerPrefill() {
@@ -338,6 +347,10 @@ struct PeerPrefill {
         if (s) cudaStreamSynchronize(s);
         ggemm.reset();
         if (ev_gdone) cudaEventDestroy(ev_gdone);
+        if (gcp) cudaStreamSynchronize(gcp);
+        for (cudaEvent_t e : ev_xin) if (e) cudaEventDestroy(e);
+        for (int i = 0; i < 2; ++i) { if (ev_ycomp[i]) cudaEventDestroy(ev_ycomp[i]); if (ev_ycopied[i]) cudaEventDestroy(ev_ycopied[i]); }
+        if (gcp) cudaStreamDestroy(gcp);
         ctx.reset();
         for (void* p : owned) cudaFree(p);
         if (ev_done) cudaEventDestroy(ev_done);
@@ -1064,8 +1077,11 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
             pp->gz = (float*) take((size_t) Ts * (ZV / 2) * 4);
             pp->ggate = (float*) take((size_t) Ts * HV * 4);
             pp->gbeta = (float*) take((size_t) Ts * HV * 4);
-            pp->gw = (float*) take((size_t) C * 4 * 4);
-            pp->ggamma = (float*) take(128 * 4);
+            // the conv weights and the norm gamma of EVERY GDN layer stay on the peer (5.9 MB; copied on first use)
+            const int64_t gl = m.g->n_layers;
+            pp->gw = (float*) take((size_t) gl * C * 4 * 4);
+            pp->ggamma = (float*) take((size_t) gl * 128 * 4);
+            pp->gw_have.assign((size_t) gl, 0);
             const size_t gws = 32u << 20;   // the primary's GEMM workspace size: the same cuBLAS heuristics
             // the peer's half of attn_qkv (5120 rows) and attn_gate (3072 rows), dequantized once per layer
             uint16_t* gsc = (uint16_t*) take((size_t) (C / 2 + ZV / 2) * N * 2);
@@ -1075,6 +1091,18 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
                 std::string ge;
                 ok = pp->ggemm->init_external(pp->s, gsc, (C / 2 + ZV / 2) * N, gwk, gws, ge) &&
                      cudaEventCreateWithFlags(&pp->ev_gdone, cudaEventDisableTiming) == cudaSuccess;
+            }
+            const char* pv = std::getenv("STRATA_PF_GDN_PIPE");
+            if (ok && (pv == nullptr || std::atoi(pv) != 0)) {
+                pp->gy16[0] = (uint16_t*) take((size_t) Ts * (ZV / 2) * 2);
+                pp->gy16[1] = (uint16_t*) take((size_t) Ts * (ZV / 2) * 2);
+                ok = ok && cudaStreamCreateWithFlags(&pp->gcp, cudaStreamNonBlocking) == cudaSuccess;
+                pp->ev_xin.assign((size_t) ((m.T_max + Ts - 1) / Ts + 1), nullptr);
+                for (auto& e : pp->ev_xin) ok = ok && cudaEventCreateWithFlags(&e, cudaEventDisableTiming) == cudaSuccess;
+                for (int i = 0; i < 2; ++i)
+                    ok = ok && cudaEventCreateWithFlags(&pp->ev_ycomp[i], cudaEventDisableTiming) == cudaSuccess &&
+                         cudaEventCreateWithFlags(&pp->ev_ycopied[i], cudaEventDisableTiming) == cudaSuccess;
+                pp->gpipe = ok;
             }
             pp->gdn = ok;
         }
@@ -1723,27 +1751,64 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
                             const cudaStream_t ps = P.s;
                             cudaStreamWaitEvent(ps, P.ev_gin, 0);
                             pe.mark(kPeGdnIn, ps);
-                            cudaMemcpyPeerAsync(P.gx, P.dev, m.mixed_h, prevd, (size_t) T * N * 2, ps);
-                            cudaMemcpyPeerAsync(P.gw, P.dev, wc->data, prevd, (size_t) C * 4 * 4, ps);
-                            cudaMemcpyPeerAsync(P.ggamma, P.dev, wnm->data, prevd, 128 * 4, ps);
+                            if (P.gpipe) {   // the activations pass by pass on the copy stream
+                                cudaStreamWaitEvent(P.gcp, P.ev_gin, 0);
+                                int k = 0;
+                                for (int64_t t0 = 0; t0 < T; t0 += P.gdn_sub, ++k) {
+                                    const int64_t nt = std::min(P.gdn_sub, T - t0);
+                                    cudaMemcpyPeerAsync(P.gx + t0 * N, P.dev, m.mixed_h + t0 * N, prevd, (size_t) nt * N * 2, P.gcp);
+                                    cudaEventRecord(P.ev_xin[(size_t) k], P.gcp);
+                                }
+                            } else {
+                                cudaMemcpyPeerAsync(P.gx, P.dev, m.mixed_h, prevd, (size_t) T * N * 2, ps);
+                            }
+                            float* gw = P.gw + (size_t) l * C * 4;
+                            float* ggamma = P.ggamma + (size_t) l * 128;
+                            if (!P.gw_have[(size_t) l]) {
+                                cudaMemcpyPeerAsync(gw, P.dev, wc->data, prevd, (size_t) C * 4 * 4, ps);
+                                cudaMemcpyPeerAsync(ggamma, P.dev, wnm->data, prevd, 128 * 4, ps);
+                                P.gw_have[(size_t) l] = 1;
+                            }
                             pe.mark(kPeGdn, ps);
                             bool gates = false;
                             uint16_t* wq16 = P.ggemm->scratch();
                             uint16_t* wz16 = wq16 + (C / 2) * N;
                             P.ggemm->dequant_runs(wqkv->native_type, wqkv->native_data, qr0[1], qrn, 5, N, wq16);
                             P.ggemm->dequant_runs(wg->native_type, wg->native_data, zr0[1], zrn, 3, N, wz16);
-                            for (int64_t t0 = 0; t0 < T; t0 += P.gdn_sub) {
+                            int k = 0;
+                            for (int64_t t0 = 0; t0 < T; t0 += P.gdn_sub, ++k) {
                                 const int64_t nt = std::min(P.gdn_sub, T - t0);
+                                if (P.gpipe) cudaStreamWaitEvent(ps, P.ev_xin[(size_t) k], 0);
                                 P.ggemm->f16_exact(P.gx + t0 * N, wq16, P.gqkv, nt, C / 2, N, C / 2, T, C);
                                 P.ggemm->f16_exact(P.gx + t0 * N, wz16, P.gz, nt, ZV / 2, N, ZV / 2, T, ZV);
-                                gdn_conv_half(conv, P.gqkv, P.gw, P.ghbuf, nt, EPS, (int) H8, ps);
+                                gdn_conv_half(conv, P.gqkv, gw, P.ghbuf, nt, EPS, (int) H8, ps);
                                 if (!gates) { cudaStreamWaitEvent(ps, P.ev_ggates, 0); gates = true; }
                                 cudaMemcpyPeerAsync(P.ggate, P.dev, m.gate + t0 * HV, prevd, (size_t) nt * HV * 4, ps);
                                 cudaMemcpyPeerAsync(P.gbeta, P.dev, m.beta + t0 * HV, prevd, (size_t) nt * HV * 4, ps);
-                                gdn_recurrence_half(state, P.ghbuf, P.ggate, P.gbeta, P.gz, P.ggamma, EPS, P.gqkv,
-                                                    m.y_h + t0 * ZV, ZV, true, (int) H8, nt, ps);
+                                if (P.gpipe) {
+                                    const int b = k & 1;
+                                    if (P.ylive[b]) cudaStreamWaitEvent(ps, P.ev_ycopied[b], 0);
+                                    gdn_recurrence_half(state, P.ghbuf, P.ggate, P.gbeta, P.gz, ggamma, EPS, P.gqkv,
+                                                        P.gy16[b], ZV / 2, false, (int) H8, nt, ps);
+                                    cudaEventRecord(P.ev_ycomp[b], ps);
+                                    cudaStreamWaitEvent(P.gcp, P.ev_ycomp[b], 0);
+                                    for (int g3 = 0; g3 < 3; ++g3)   // v heads (g3*16+8 .. +8): 1024 columns per run
+                                        cudaMemcpy2DAsync(m.y_h + t0 * ZV + (g3 * HQ + H8) * SS, (size_t) ZV * 2,
+                                                          P.gy16[b] + g3 * H8 * SS, (size_t) (ZV / 2) * 2, (size_t) H8 * SS * 2,
+                                                          (size_t) nt, cudaMemcpyDefault, P.gcp);
+                                    cudaEventRecord(P.ev_ycopied[b], P.gcp);
+                                    P.ylive[b] = true;
+                                } else {
+                                    gdn_recurrence_half(state, P.ghbuf, P.ggate, P.gbeta, P.gz, ggamma, EPS, P.gqkv,
+                                                        m.y_h + t0 * ZV, ZV, true, (int) H8, nt, ps);
+                                }
                             }
-                            cudaEventRecord(P.ev_gdone, ps);
+                            if (P.gpipe) {   // done = the last y16 rows landed (after every compute step on ps)
+                                cudaEventRecord(P.ev_gdone, P.gcp);
+                                cudaStreamWaitEvent(ps, P.ev_gdone, 0);   // the next user of gx/gy16 on ps waits too
+                                P.ylive[0] = P.ylive[1] = false;
+                            }
+                            if (!P.gpipe) cudaEventRecord(P.ev_gdone, ps);
                             pe.mark(kPeIdle, ps);
                             cudaSetDevice(prevd);
                             ++P.gdn_layers;

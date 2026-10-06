@@ -71,6 +71,9 @@ Useful GB/s (one payload, so a bounce's second PCIe crossing counts against it):
 
 ## A/B
 
-`STRATA_SPLIT_P2P` (engine, after this change): unset = P2P when the cards can peer **and** the source is below
-sm_80 (this is the measured configuration; sm_80+ keeps the pinned path it has), `0` = force the pinned path,
-`1` = force P2P wherever peer access works. HIP builds keep the pinned path unconditionally.
+`STRATA_SPLIT_P2P` (engine, after this change): unset = P2P when both cards of the pair are Volta (sm_70) and can
+peer - the measured configuration, compiled only in the experimental `STRATA_EXPERIMENTAL_SM60` build (the
+ready-made engine never runs on sm_70) - and the pinned path everywhere else (sm_80+ behavior unchanged), `0` = force
+the pinned path, `1` = force P2P wherever peer access works. HIP builds keep the pinned path unconditionally. The
+A/B is bit-identical: the hand-off is a copy of the same rows, and a 330-token prompt + 32 greedy tokens on 2x V100
+(`--layer-split auto`, Swift IQ2_XS) produced the same 32 token ids with the switch on and off.

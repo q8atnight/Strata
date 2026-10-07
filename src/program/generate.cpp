@@ -6836,7 +6836,7 @@ int main(int argc, char** argv) {
         // (default 32).  The copies ride the adaptive swap path below (same streams, fences, pending/commit), so the
         // ring needs the adaptive tier on; --adapt-every 1 lets it follow every window.  Offline on a real routing
         // trace (Q4 layer split, 2x 3090): -24 % distinct CPU misses at 16 slots per layer and 32 copies per card and
-        // window (Research foresight/REPORT.md).
+        // window (tools/foresight/README.md).
         const int fs_ring = [] { const char* v = std::getenv("STRATA_FORESIGHT_RING"); return v ? std::max(0, std::atoi(v)) : 0; }();
         const int fs_budget = [] { const char* v = std::getenv("STRATA_FORESIGHT_BUDGET"); return v ? std::max(1, std::atoi(v)) : 32; }();
         const float fs_gamma = [] { const char* v = std::getenv("STRATA_FORESIGHT_GAMMA"); return v ? (float) std::atof(v) : 0.5f; }();

@@ -904,6 +904,14 @@ struct Drive {
     /// needs no locking.  `d.layers` is the CURRENT layer on entry (the adapter increments it as it walks the
     /// blob), which is why the layer index comes from there rather than from a counter of our own.
     std::FILE* routing = nullptr;
+    /// Foresight study (STRATA_FORESIGHT_DUMP=path, off by default): per pool call one record = int32 layer,
+    /// int32 n_tok, n_tok x k int32 routed ids, then n_tok x n_embd BF16 rows of this layer's normed MoE input
+    /// (the router's own input) - what a predictor of later layers' experts would see.  Capped by
+    /// STRATA_FORESIGHT_DUMP_GB (default 40).  One host thread calls the pool, so no locking.
+    std::FILE* fs_dump = nullptr;
+    int64_t fs_embd = 0;
+    uint64_t fs_bytes = 0, fs_max = 0;
+    std::vector<uint16_t> fs_row;
 };
 
 void drive_pool(void* user, const float* x_f, const int32_t* ids, const float* weights, int64_t n_embd, int64_t k,
@@ -956,6 +964,20 @@ void drive_pool_multi(void* user, const float* x_f, const int32_t* ids, int64_t 
             static const float one[64] = {};   // k <= 64 in a verify window; zeros read as unit weights
             std::fwrite(one, sizeof(float), (size_t) k, t->routing);
         }
+    }
+    if (t->fs_dump != nullptr && layer >= 0 && n_tok > 0 && t->fs_bytes < t->fs_max) {
+        const int64_t e = t->fs_embd, cells = n_tok * e;
+        if ((int64_t) t->fs_row.size() < cells) t->fs_row.resize((size_t) cells);
+        for (int64_t i = 0; i < cells; ++i) {           // float -> BF16, round to nearest even
+            uint32_t u;
+            std::memcpy(&u, x_f + i, 4);
+            t->fs_row[(size_t) i] = (uint16_t) ((u + 0x7FFFu + ((u >> 16) & 1u)) >> 16);
+        }
+        const int32_t rec[2] = {(int32_t) layer, (int32_t) n_tok};
+        std::fwrite(rec, sizeof rec, 1, t->fs_dump);
+        std::fwrite(ids, sizeof(int32_t), (size_t) (n_tok * k), t->fs_dump);
+        std::fwrite(t->fs_row.data(), sizeof(uint16_t), (size_t) cells, t->fs_dump);
+        t->fs_bytes += 8 + 4 * (uint64_t) (n_tok * k) + 2 * (uint64_t) cells;
     }
 }
 
@@ -4460,6 +4482,18 @@ int main(int argc, char** argv) {
         }
         drive.routing = routing;
     }
+    if (const char* fs_path = std::getenv("STRATA_FORESIGHT_DUMP"); fs_path != nullptr && fs_path[0] != 0) {
+        drive.fs_dump = std::fopen(fs_path, "wb");
+        if (drive.fs_dump == nullptr) {
+            std::fprintf(stderr, "strata generate: cannot write the foresight dump %s\n", fs_path);
+            return 1;
+        }
+        const char* gb = std::getenv("STRATA_FORESIGHT_DUMP_GB");
+        drive.fs_max = (uint64_t) ((gb != nullptr ? std::atof(gb) : 40.0) * 1e9);
+        drive.fs_embd = g.n_embd;
+        std::fprintf(stderr, "strata generate: foresight dump -> %s (k=%d, n_embd %lld, BF16 rows, cap %.1f GB)\n",
+                     fs_path, 10, (long long) g.n_embd, (double) drive.fs_max / 1e9);
+    }
     strata::core::PoolFn pool_fn = o.no_pool ? nullptr : &drive_pool;
     // The hit hook rides the same switch as the pool: with no pool there is no `parts` staging to
     // write into, and a hit path with nowhere to write is a wrong token rather than an error.
@@ -6794,6 +6828,24 @@ int main(int argc, char** argv) {
             res_upload();
         };
         // --pipeline-windows: set while the tier adapts beside windows in flight (see its use in adapt)
+        // ---- Foresight recency ring (STRATA_FORESIGHT_RING=N; unset or 0 = off, and then nothing below changes a
+        // single decision of the adaptive tier).  N slots per layer - that layer's coldest residents at the first
+        // round - leave the frequency tier and follow the conversation's RECENT routing instead: every round, experts
+        // routed lately but not in VRAM (per-round counts decayed by STRATA_FORESIGHT_GAMMA, default 0.5) replace the
+        // ring member of their layer used least lately, up to STRATA_FORESIGHT_BUDGET copies per card and round
+        // (default 32).  The copies ride the adaptive swap path below (same streams, fences, pending/commit), so the
+        // ring needs the adaptive tier on; --adapt-every 1 lets it follow every window.  Offline on a real routing
+        // trace (Q4 layer split, 2x 3090): -24 % distinct CPU misses at 16 slots per layer and 32 copies per card and
+        // window (Research foresight/REPORT.md).
+        const int fs_ring = [] { const char* v = std::getenv("STRATA_FORESIGHT_RING"); return v ? std::max(0, std::atoi(v)) : 0; }();
+        const int fs_budget = [] { const char* v = std::getenv("STRATA_FORESIGHT_BUDGET"); return v ? std::max(1, std::atoi(v)) : 32; }();
+        const float fs_gamma = [] { const char* v = std::getenv("STRATA_FORESIGHT_GAMMA"); return v ? (float) std::atof(v) : 0.5f; }();
+        std::vector<float> fs_heat, fs_prev;
+        std::vector<uint8_t> fs_member;      // (layer, expert) occupies a ring slot
+        int64_t fs_swaps_total = 0;
+        if (fs_ring > 0 && drive.d.usage.empty())
+            std::fprintf(stderr, "strata serve: STRATA_FORESIGHT_RING needs the adaptive tier (--adapt-every and "
+                                 "--adapt-swaps above 0): the ring stays off\n");
         std::function<void()> adapt_fence;
         // the VRAM tier follows the conversation (the same rule as the speculative loop below)
         auto adapt = [&]() -> bool {
@@ -6809,7 +6861,7 @@ int main(int argc, char** argv) {
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
                     if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
-                    else vict.emplace_back(u[e], e);
+                    else if (fs_member.empty() || !fs_member[(size_t) (l * g.n_expert + e)]) vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
                 std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
@@ -6823,6 +6875,77 @@ int main(int argc, char** argv) {
             }
             std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
             if ((int) swaps.size() > o.adapt_swaps) swaps.resize((size_t) o.adapt_swaps);
+            if (fs_ring > 0 && !drive.d.usage.empty()) {   // Foresight recency ring (see fs_ring above)
+                const int64_t NE = g.n_expert;
+                const size_t NLE = (size_t) (g.n_layers * NE);
+                const float* u = drive.d.usage.data();
+                if (fs_member.empty()) {   // first round: each layer's coldest residents become its ring
+                    fs_member.assign(NLE, 0);
+                    fs_heat.assign(NLE, 0.0f);
+                    fs_prev.assign(NLE, 0.0f);
+                    std::vector<std::pair<float, int32_t>> rl;
+                    size_t members = 0;
+                    for (int64_t l = 0; l < g.n_layers; ++l) {
+                        rl.clear();
+                        for (int32_t e = 0; e < (int32_t) NE; ++e)
+                            if (host_res[(size_t) (l * NE + e)] >= 0) rl.emplace_back(u[l * NE + e], e);
+                        const size_t n = std::min((size_t) fs_ring, rl.size());
+                        std::partial_sort(rl.begin(), rl.begin() + (ptrdiff_t) n, rl.end(),
+                                          [](auto& a, auto& b) { return a.first < b.first; });
+                        for (size_t i = 0; i < n; ++i) fs_member[(size_t) (l * NE + rl[i].second)] = 1;
+                        members += n;
+                    }
+                    std::fprintf(stderr, "strata serve: foresight ring: %d slots per layer (%zu in all), up to %d "
+                                         "copies per card and round, gamma %.2f\n", fs_ring, members, fs_budget,
+                                 (double) fs_gamma);
+                }
+                for (size_t i = 0; i < NLE; ++i) {
+                    const float c = u[i] - fs_prev[i];
+                    fs_heat[i] = fs_heat[i] * fs_gamma + (c > 0.0f ? c : 0.0f);
+                }
+                std::vector<uint8_t> taken(NLE, 0);
+                for (const Swap& sw : swaps) {
+                    taken[(size_t) (sw.layer * NE + sw.in)] = 1;
+                    taken[(size_t) (sw.layer * NE + sw.out)] = 1;
+                }
+                std::vector<std::pair<float, int32_t>> fc;   // (recent heat, residency index) of experts not in VRAM
+                for (size_t i = 0; i < NLE; ++i) {
+                    if (host_res[i] >= 0 || fs_heat[i] <= 0.0f || taken[i]) continue;
+                    const int64_t l = (int64_t) i / NE;
+                    const int32_t e = (int32_t) ((int64_t) i % NE);
+                    if ((peer.valid() && peer.has(l, e)) || (remote_opt && remote_opt->owns(l, e)) || helper_holds(l, e))
+                        continue;
+                    fc.emplace_back(fs_heat[i], (int32_t) i);
+                }
+                std::sort(fc.begin(), fc.end(), [](auto& a, auto& b) { return a.first > b.first; });
+                std::vector<std::vector<std::pair<float, int32_t>>> vic((size_t) g.n_layers);
+                std::vector<uint8_t> vic_built((size_t) g.n_layers, 0);
+                std::vector<size_t> vic_pos((size_t) g.n_layers, 0);
+                std::vector<int> per_card(stages.size() + 1, 0);
+                for (const auto& [h, i] : fc) {
+                    const int64_t l = (int64_t) i / NE;
+                    const int card = multi_gpu ? stage_of(l) : 0;
+                    if (card < 0 || card >= (int) per_card.size() || per_card[(size_t) card] >= fs_budget) continue;
+                    auto& V = vic[(size_t) l];
+                    if (!vic_built[(size_t) l]) {   // this layer's ring members, least used lately first
+                        for (int32_t e = 0; e < (int32_t) NE; ++e) {
+                            const size_t x = (size_t) (l * NE + e);
+                            if (fs_member[x] && host_res[x] >= 0 && !taken[x]) V.emplace_back(fs_heat[x], e);
+                        }
+                        std::sort(V.begin(), V.end(), [](auto& a, auto& b) { return a.first < b.first; });
+                        vic_built[(size_t) l] = 1;
+                    }
+                    size_t& p = vic_pos[(size_t) l];
+                    if (p >= V.size() || V[p].first >= h) continue;   // nothing in this layer's ring is colder
+                    const int32_t out = V[p].second;
+                    swaps.push_back({h - V[p].first, (int32_t) l, (int32_t) ((int64_t) i % NE), out});
+                    ++p;
+                    fs_member[(size_t) (l * NE + out)] = 0;
+                    fs_member[(size_t) i] = 1;
+                    ++per_card[(size_t) card];
+                    ++fs_swaps_total;
+                }
+            }
             // the copies back read the cache of the card that owns each layer (see resident_stage_swaps)
             auto home_of = [&](int64_t layer) -> SwapHome {
                 const int stn = multi_gpu ? stage_of(layer) : 0;
@@ -6921,6 +7044,7 @@ int main(int argc, char** argv) {
                 }
             }
             for (float& v : drive.d.usage) v *= o.adapt_decay;
+            if (!fs_prev.empty()) std::copy(drive.d.usage.begin(), drive.d.usage.end(), fs_prev.begin());
             return true;
         };
         // ---- --adapt-async 1: the asynchronous adaptive tier (opt-in; the resident RAM mode, see the checks where

@@ -1,0 +1,16 @@
+{
+ "_note": "Round 2 real-screenshot facts, hand-scored (Claude) against questions-v2.json truth; 1 right, 0.5 partly, 0 wrong. Order: questions.",
+ "r01-cars-chart-alerts.png": {"r2-f16-6144": [1,1,1,1,1,1], "r2-f16-2048": [1,1,1,1,1,1], "r2-q8-6144": [1,1,1,1,1,1], "r2-q6k-6144": [1,1,1,1,1,1], "r2-q4-6144": [1,1,1,1,1,1]},
+ "r02-cars-detail.png": {"r2-f16-6144": [1,1,1,1,1,0,0.5,1], "r2-f16-2048": [1,1,1,1,1,0,1,1], "r2-q8-6144": [1,1,1,1,1,0,0.5,1], "r2-q6k-6144": [1,1,1,1,1,0,0.5,1], "r2-q4-6144": [1,1,1,1,1,0,0.5,0],
+   "comment": "Q6 all say OVERVIEW selected; zoom shows all four tabs identical. Q7 zoom: 1-2 px between tabs and tiles; 'a small gap' = half. Q8 Q4_0 says value on the SAME line (wrong)"},
+ "r03-minimal-example.png": {"r2-f16-6144": [1,0.5,1,1,1], "r2-f16-2048": [1,0.5,1,0.5,1], "r2-q8-6144": [1,0.5,1,1,1], "r2-q6k-6144": [1,1,1,1,1], "r2-q4-6144": [1,0.5,1,0.5,1],
+   "comment": "Q2 measured ~4 / ~7 px: Q6_K '5-8 px' right, others 8-20 px. Q4 at full size F16/Q8/Q6_K correctly leave out 'AED 11,240 open'; 2048 and Q4_0 include it"},
+ "r04-meta-elements.png": {"r2-f16-6144": [0.5,1,1,1], "r2-f16-2048": [0.5,1,1,0.5], "r2-q8-6144": [1,1,1,1], "r2-q6k-6144": [0.5,1,1,0], "r2-q4-6144": [0.5,1,1,0],
+   "comment": "Q1 only Q8_0 names both overlaps. Q4 Q6_K/Q4_0 answer 'Yes, same brightness'"},
+ "r05-telltale-example.png": {"r2-f16-6144": [1,1,1,0.5,1,1], "r2-f16-2048": [1,1,1,1,0,1], "r2-q8-6144": [1,1,1,1,1,1], "r2-q6k-6144": [1,1,1,1,1,1], "r2-q4-6144": [1,1,1,1,1,1],
+   "comment": "Q5 (rows almost touch): only F16@2048 says 'larger' (wrong). Q4 F16@6144 opens with 'Yes'"},
+ "r06-terminal-mobile.png": {"r2-f16-6144": [0.5,1,1,1], "r2-f16-2048": [0.5,1,1,1], "r2-q8-6144": [1,1,1,1], "r2-q6k-6144": [1,1,1,1], "r2-q4-6144": [1,1,1,1],
+   "comment": "Q1 both F16 runs miss the clipped right card column"},
+ "r07-minimal-elements.png": {"r2-f16-6144": [1,1,1,1,1], "r2-f16-2048": [0.5,1,1,1,1], "r2-q8-6144": [1,1,1,1,1], "r2-q6k-6144": [0.5,1,1,1,1], "r2-q4-6144": [1,1,1,1,1],
+   "comment": "Q1 credit when the crowded 'Search' label is named as well as the caption collision"}
+}

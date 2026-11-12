@@ -1,0 +1,264 @@
+{
+ "r01-cars-chart-alerts.png": {
+  "q": [
+   "How many data lines are in the chart, and what colour is each?",
+   "Which line is highest at NOV?",
+   "How many alert rows are in ALERTS, and are their bracketed action buttons lined up in one common column (same left edge)?",
+   "In the DUES table, is any column header cut off at the right edge? Which?",
+   "In UPCOMING RETURNS, how is the deposit for rental 218 shown (colour, number of lines)?",
+   "Describe any small decorative marks at the corners of the panels."
+  ],
+  "truth": [
+   "3: green, orange, red",
+   "green",
+   "4 rows; NO - each button sits right after its text, ragged left edges",
+   "yes, the last header is cut ('STA...' = status)",
+   "'AED 2,000' in red/salmon, wrapped over 2 lines",
+   "thin L-shaped corner brackets at top-left and bottom-right of panels"
+  ]
+ },
+ "r02-cars-detail.png": {
+  "q": [
+   "Which pagination button is the active page and how is it marked?",
+   "Of the three buttons after '2 selected', which looks disabled/dimmed?",
+   "The line under CAR DETAIL repeats one value. What is repeated?",
+   "How many info tiles are in the first row, and where does the next tile go?",
+   "How many thin vertical separator lines are between the items of the action bar (+ ADD BOOKING ... ARCHIVE)?",
+   "Which of the tabs OVERVIEW / CHARGES / DOCUMENTS / NOTES looks selected?",
+   "Is there a visible gap between the tab row and the tiles below it?",
+   "In CURRENT RENTAL, where is each value placed relative to its label?"
+  ],
+  "truth": [
+   "[ 1 ], orange outline/text",
+   "CLEAR",
+   "the year 2022 ('black · 2022 2022')",
+   "4 (Mileage, Service, Insurance, Registration); VAT wraps alone to a second row",
+   "4",
+   "none is clearly marked as selected",
+   "no / almost none - tabs touch the tiles",
+   "label on its own line at left; value on the next line, right-aligned far away"
+  ]
+ },
+ "r03-minimal-example.png": {
+  "q": [
+   "What text is in the user chip at the top right of the top bar, exactly as written?",
+   "How much space is there between the blue '+ Add booking' button and the 'Impakt Cars' title above it and the 'Dashboard' heading below it?",
+   "How many KPI cards are in the first row and in the second row?",
+   "Which KPI subtitle lines use a different (monospace) font from the rest?",
+   "What happens at the very bottom of the screen with the grey bar and the chart?"
+  ],
+  "truth": [
+   "'AAndy' (initial and name run together)",
+   "almost none - button touches title and heading (cramped)",
+   "4 and 2",
+   "the date/month parts: 'next 18.11.2026', 'Nov 2026' (x3)",
+   "a sticky grey footer bar covers the bottom of the chart"
+  ]
+ },
+ "r04-meta-elements.png": {
+  "q": [
+   "Which elements overlap each other on this page?",
+   "Which sidebar item is active and how is it marked?",
+   "What are the two group headings in the right-hand panel?",
+   "Is the 'A · Navigation' heading the same brightness as normal text?"
+  ],
+  "truth": [
+   "the Command box overlaps the sidebar list and the caption text below; the right panel covers the right part of the Navigation section",
+   "Fleet: accent/blue left bar + tinted background",
+   "PRIMARY and SECONDARY",
+   "no - dimmer/greyer (low contrast)"
+  ]
+ },
+ "r05-telltale-example.png": {
+  "q": [
+   "List the four alert chips under 'Add booking' with their counts.",
+   "Which FLEET STATUS chip is highlighted?",
+   "Look at the text under each gauge. Is anything wrong with how it wraps or runs together?",
+   "Do the left/right edges of the 3 top summary cards line up with the edges of the 4 gauge cards below them?",
+   "Compare the vertical gap between the summary row and the gauge row with the horizontal gaps between cards. Consistent?",
+   "What colours are on the FLEET UTILISATION gauge arc?"
+  ],
+  "truth": [
+   "Payment overdue 4, Salik unpaid 1, Document expiring 1, Service due 1",
+   "ON RENT",
+   "yes - target value is split from 'target' and runs into the next text: 'target 30 8 / free today', '80 27 of 34 cars out', '95 paid AED...'",
+   "no - 3-column and 4-column grids don't align",
+   "no - vertical gap ~0 (cards touch), horizontal gap ~16 px",
+   "red, amber/orange, green"
+  ]
+ },
+ "r06-terminal-mobile.png": {
+  "q": [
+   "What content is cut off at the right edge of the phone frame?",
+   "Which single-character symbols appear before the card titles, and on which cards?",
+   "Is the 'IMPAKT CARS' logo text in the top bar fully visible?",
+   "Which range tab (6M / 12M / YTD / CUSTOM) is active and how is it shown?"
+  ],
+  "truth": [
+   "user name 'An(dy)', right card column text ('vs'), chart legend 'NE(T)', card right edges",
+   "~ due within 14 days; ! overdue payments; + income; ! expenses; * net (none on cars on rent)",
+   "no - top of 'IMPAKT' is clipped",
+   "6M, light/white filled background"
+  ]
+ },
+ "r07-minimal-elements.png": {
+  "q": [
+   "Describe any text or elements that overlap or collide in the TOP BAR area.",
+   "Which item is active in the left SIDEBAR, and which in the right panel? How are they marked?",
+   "What are the group headings in the right panel?",
+   "What is the small coloured text at the top right corner of the page?",
+   "Why does the left panel look grey?"
+  ],
+  "truth": [
+   "'Search' label floats above the input; the input overlaps the caption '48 px bar...' below it",
+   "Fleet in sidebar, Dashboard in right panel; blue text + thin blue left rule",
+   "Fleet, Money, Workspace",
+   "a legend: Income (green), Expenses (red), Net (blue)",
+   "a dark/grey modal overlay (scrim) dims it behind the drawer/command dialog"
+  ]
+ },
+ "s02-button-gaps.png": {
+  "q": [
+   "How many buttons are there, and is the spacing between neighbouring buttons equal? If not, between which two buttons is the gap different?\nEnd your reply with one final line exactly in this form: ANSWER: <first button>-<second button> or ANSWER: equal"
+  ],
+  "truth": [
+   "Move-Share"
+  ]
+ },
+ "s04-dialog-centering.png": {
+  "q": [
+   "Is the white dialog exactly horizontally centred on the dark background? If not, which side has the bigger margin?\nEnd your reply with one final line exactly in this form: ANSWER: centred / bigger-left / bigger-right"
+  ],
+  "truth": [
+   "bigger-right"
+  ]
+ },
+ "s07-tab-underline.png": {
+  "q": [
+   "Which tab is marked as the active tab, and how is it marked?\nEnd your reply with one final line exactly in this form: ANSWER: <tab name>"
+  ],
+  "truth": [
+   "Documents"
+  ]
+ },
+ "s08-dashed-divider.png": {
+  "q": [
+   "Which divider line looks different from the others, and how?\nEnd your reply with one final line exactly in this form: ANSWER: Section <number>"
+  ],
+  "truth": [
+   "Section 3"
+  ]
+ },
+ "s10-icon-size.png": {
+  "q": [
+   "Are all the circles the same size? If not, which one is different (count from the left) and how?\nEnd your reply with one final line exactly in this form: ANSWER: <position from left> <smaller|bigger> or ANSWER: all equal"
+  ],
+  "truth": [
+   "4 smaller"
+  ]
+ },
+ "h02-button-gaps-small.png": {
+  "q": [
+   "Is the spacing between all neighbouring buttons exactly equal? If not, between which two buttons is it different?\nEnd your reply with one final line exactly in this form: ANSWER: <first button>-<second button> or ANSWER: equal"
+  ],
+  "truth": [
+   "Export-Share"
+  ]
+ },
+ "h03-dialog-12px.png": {
+  "q": [
+   "Is the white dialog exactly horizontally centred? If not, which side has the bigger margin?\nEnd your reply with one final line exactly in this form: ANSWER: centred / bigger-left / bigger-right"
+  ],
+  "truth": [
+   "bigger-right"
+  ]
+ },
+ "h05-circle-small-diff.png": {
+  "q": [
+   "Are all the circles exactly the same size? If not, which one (count from the left) differs?\nEnd your reply with one final line exactly in this form: ANSWER: <position from left> <smaller|bigger> or ANSWER: all equal"
+  ],
+  "truth": [
+   "5 smaller"
+  ]
+ },
+ "h07-border-colour.png": {
+  "q": [
+   "Do all four boxes have the same border colour? If not, which box differs and how?\nEnd your reply with one final line exactly in this form: ANSWER: <box letter> or ANSWER: all same"
+  ],
+  "truth": [
+   "B"
+  ]
+ },
+ "d01-dark-hairlines.png": {
+  "q": [
+   "There are horizontal divider lines under Row A to Row E. Are they all the same thickness? If not, give each row's line as thin / medium / thick.\nEnd your reply with one final line exactly in this form: ANSWER: A=<..> B=<..> C=<..> D=<..> E=<..>"
+  ],
+  "truth": [
+   "A=thin B=medium C=thin D=thick E=thin"
+  ]
+ },
+ "d03-dark-card-shift.png": {
+  "q": [
+   "Are all the cards exactly left-aligned? If one is shifted, which one and in which direction?\nEnd your reply with one final line exactly in this form: ANSWER: Card <n> <left|right> or ANSWER: all aligned"
+  ],
+  "truth": [
+   "Card 2 left"
+  ]
+ },
+ "d05-dark-missing-border.png": {
+  "q": [
+   "Each box should have a complete border on all four sides. Is any box missing part of its border? Which box and which side?\nEnd your reply with one final line exactly in this form: ANSWER: <box name> <top|bottom|left|right> or ANSWER: none"
+  ],
+  "truth": [
+   "Insurance right"
+  ]
+ },
+ "d06-dark-baseline.png": {
+  "q": [
+   "In each row, is the value on the right exactly on the same baseline as its label on the left? If a row is off, which one, and is the value higher or lower?\nEnd your reply with one final line exactly in this form: ANSWER: <row label> <higher|lower> or ANSWER: all aligned"
+  ],
+  "truth": [
+   "Phone higher"
+  ]
+ },
+ "d09-dark-gridlines.png": {
+  "q": [
+   "Count the vertical lines and the horizontal lines in the grid, including the outer frame edges.\nEnd your reply with one final line exactly in this form: ANSWER: <vertical> vertical, <horizontal> horizontal"
+  ],
+  "truth": [
+   "8 vertical, 6 horizontal"
+  ]
+ },
+ "e01-dark-card-shift-3px.png": {
+  "q": [
+   "Are all six cards exactly left-aligned? If one is shifted, which one and which direction?\nEnd your reply with one final line exactly in this form: ANSWER: Card <n> <left|right> or ANSWER: all aligned"
+  ],
+  "truth": [
+   "Card 4 right"
+  ]
+ },
+ "e04-dark-faint-dividers.png": {
+  "q": [
+   "Some items have a very faint divider line under them. Which item does NOT have one?\nEnd your reply with one final line exactly in this form: ANSWER: Item <n> or ANSWER: all have one"
+  ],
+  "truth": [
+   "Item 2"
+  ]
+ },
+ "e06-dark-count-10-lines.png": {
+  "q": [
+   "Count the thin vertical lines exactly.\nEnd your reply with one final line exactly in this form: ANSWER: <number>"
+  ],
+  "truth": [
+   "10"
+  ]
+ },
+ "e08-dark-columns-3px.png": {
+  "q": [
+   "Are the left and right text columns on exactly the same baselines? If not, which column sits lower?\nEnd your reply with one final line exactly in this form: ANSWER: left / right / same"
+  ],
+  "truth": [
+   "left"
+  ]
+ }
+}

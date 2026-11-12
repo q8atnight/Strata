@@ -1,0 +1,372 @@
+{
+ "r2-f16-6144": {
+  "s02-button-gaps.png": [
+   1.0,
+   "Move-Share"
+  ],
+  "s04-dialog-centering.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "s07-tab-underline.png": [
+   1.0,
+   "Documents"
+  ],
+  "s08-dashed-divider.png": [
+   1.0,
+   "Section 3"
+  ],
+  "s10-icon-size.png": [
+   1.0,
+   "4 smaller"
+  ],
+  "h02-button-gaps-small.png": [
+   1.0,
+   "Export-Share"
+  ],
+  "h03-dialog-12px.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "h05-circle-small-diff.png": [
+   1.0,
+   "5 smaller"
+  ],
+  "h07-border-colour.png": [
+   1.0,
+   "B"
+  ],
+  "d01-dark-hairlines.png": [
+   0.8,
+   "A=thin B=thin C=thin D=thick E=thin"
+  ],
+  "d03-dark-card-shift.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d05-dark-missing-border.png": [
+   1.0,
+   "Insurance right"
+  ],
+  "d06-dark-baseline.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d09-dark-gridlines.png": [
+   1.0,
+   "8 vertical, 6 horizontal"
+  ],
+  "e01-dark-card-shift-3px.png": [
+   0.0,
+   "all aligned"
+  ],
+  "e04-dark-faint-dividers.png": [
+   1.0,
+   "Item 2"
+  ],
+  "e06-dark-count-10-lines.png": [
+   1.0,
+   "10"
+  ],
+  "e08-dark-columns-3px.png": [
+   1.0,
+   "left"
+  ]
+ },
+ "r2-f16-2048": {
+  "s02-button-gaps.png": [
+   1.0,
+   "Move-Share"
+  ],
+  "s04-dialog-centering.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "s07-tab-underline.png": [
+   1.0,
+   "Documents"
+  ],
+  "s08-dashed-divider.png": [
+   1.0,
+   "Section 3"
+  ],
+  "s10-icon-size.png": [
+   1.0,
+   "4 smaller"
+  ],
+  "h02-button-gaps-small.png": [
+   1.0,
+   "Export-Share"
+  ],
+  "h03-dialog-12px.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "h05-circle-small-diff.png": [
+   1.0,
+   "5 smaller"
+  ],
+  "h07-border-colour.png": [
+   1.0,
+   "B"
+  ],
+  "d01-dark-hairlines.png": [
+   0.8,
+   "A=thin B=thin C=thin D=thick E=thin"
+  ],
+  "d03-dark-card-shift.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d05-dark-missing-border.png": [
+   1.0,
+   "Insurance right"
+  ],
+  "d06-dark-baseline.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d09-dark-gridlines.png": [
+   1.0,
+   "8 vertical, 6 horizontal"
+  ],
+  "e01-dark-card-shift-3px.png": [
+   0.0,
+   "all aligned"
+  ],
+  "e04-dark-faint-dividers.png": [
+   1.0,
+   "Item 2"
+  ],
+  "e06-dark-count-10-lines.png": [
+   1.0,
+   "10"
+  ],
+  "e08-dark-columns-3px.png": [
+   1.0,
+   "left"
+  ]
+ },
+ "r2-q8-6144": {
+  "s02-button-gaps.png": [
+   1.0,
+   "Move-Share"
+  ],
+  "s04-dialog-centering.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "s07-tab-underline.png": [
+   1.0,
+   "Documents"
+  ],
+  "s08-dashed-divider.png": [
+   1.0,
+   "Section 3"
+  ],
+  "s10-icon-size.png": [
+   1.0,
+   "4 smaller"
+  ],
+  "h02-button-gaps-small.png": [
+   1.0,
+   "Export-Share"
+  ],
+  "h03-dialog-12px.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "h05-circle-small-diff.png": [
+   1.0,
+   "5 smaller"
+  ],
+  "h07-border-colour.png": [
+   1.0,
+   "B"
+  ],
+  "d01-dark-hairlines.png": [
+   0.6,
+   "A=thin B=thin C=thin D=medium E=thin"
+  ],
+  "d03-dark-card-shift.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d05-dark-missing-border.png": [
+   1.0,
+   "Insurance right"
+  ],
+  "d06-dark-baseline.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d09-dark-gridlines.png": [
+   0.0,
+   "9 vertical, 6 horizontal"
+  ],
+  "e01-dark-card-shift-3px.png": [
+   0.0,
+   "all aligned"
+  ],
+  "e04-dark-faint-dividers.png": [
+   1.0,
+   "Item 2"
+  ],
+  "e06-dark-count-10-lines.png": [
+   1.0,
+   "10"
+  ],
+  "e08-dark-columns-3px.png": [
+   1.0,
+   "left"
+  ]
+ },
+ "r2-q6k-6144": {
+  "s02-button-gaps.png": [
+   1.0,
+   "Move-Share"
+  ],
+  "s04-dialog-centering.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "s07-tab-underline.png": [
+   1.0,
+   "Documents"
+  ],
+  "s08-dashed-divider.png": [
+   1.0,
+   "Section 3"
+  ],
+  "s10-icon-size.png": [
+   1.0,
+   "4 smaller"
+  ],
+  "h02-button-gaps-small.png": [
+   1.0,
+   "Export-Share"
+  ],
+  "h03-dialog-12px.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "h05-circle-small-diff.png": [
+   1.0,
+   "5 smaller"
+  ],
+  "h07-border-colour.png": [
+   1.0,
+   "Box B"
+  ],
+  "d01-dark-hairlines.png": [
+   0.8,
+   "A=thin B=thin C=thin D=thick E=thin"
+  ],
+  "d03-dark-card-shift.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d05-dark-missing-border.png": [
+   1.0,
+   "Insurance right"
+  ],
+  "d06-dark-baseline.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d09-dark-gridlines.png": [
+   1.0,
+   "8 vertical, 6 horizontal"
+  ],
+  "e01-dark-card-shift-3px.png": [
+   0.0,
+   "all aligned"
+  ],
+  "e04-dark-faint-dividers.png": [
+   1.0,
+   "Item 2"
+  ],
+  "e06-dark-count-10-lines.png": [
+   1.0,
+   "10"
+  ],
+  "e08-dark-columns-3px.png": [
+   1.0,
+   "left"
+  ]
+ },
+ "r2-q4-6144": {
+  "s02-button-gaps.png": [
+   1.0,
+   "Move-Share"
+  ],
+  "s04-dialog-centering.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "s07-tab-underline.png": [
+   1.0,
+   "Documents"
+  ],
+  "s08-dashed-divider.png": [
+   1.0,
+   "Section 3"
+  ],
+  "s10-icon-size.png": [
+   1.0,
+   "4 smaller"
+  ],
+  "h02-button-gaps-small.png": [
+   1.0,
+   "Export-Share"
+  ],
+  "h03-dialog-12px.png": [
+   1.0,
+   "bigger-right"
+  ],
+  "h05-circle-small-diff.png": [
+   1.0,
+   "5 smaller"
+  ],
+  "h07-border-colour.png": [
+   1.0,
+   "B"
+  ],
+  "d01-dark-hairlines.png": [
+   1.0,
+   "A=thin B=medium C=thin D=thick E=thin"
+  ],
+  "d03-dark-card-shift.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d05-dark-missing-border.png": [
+   1.0,
+   "Insurance right"
+  ],
+  "d06-dark-baseline.png": [
+   0.0,
+   "all aligned"
+  ],
+  "d09-dark-gridlines.png": [
+   1.0,
+   "8 vertical, 6 horizontal"
+  ],
+  "e01-dark-card-shift-3px.png": [
+   0.0,
+   "all aligned"
+  ],
+  "e04-dark-faint-dividers.png": [
+   1.0,
+   "Item 2"
+  ],
+  "e06-dark-count-10-lines.png": [
+   1.0,
+   "10"
+  ],
+  "e08-dark-columns-3px.png": [
+   1.0,
+   "left"
+  ]
+ }
+}

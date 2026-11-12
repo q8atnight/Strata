@@ -1,0 +1,44 @@
+[
+ {
+  "pic": "r01-cars-chart-alerts.png",
+  "prompt_tokens": 3579,
+  "wall_s": 4.57,
+  "llm_read_s": 1.95,
+  "picture_s": 2.62
+ },
+ {
+  "pic": "r03-minimal-example.png",
+  "prompt_tokens": 4347,
+  "wall_s": 5.77,
+  "llm_read_s": 2.08,
+  "picture_s": 3.69
+ },
+ {
+  "pic": "r05-telltale-example.png",
+  "prompt_tokens": 4348,
+  "wall_s": 5.72,
+  "llm_read_s": 2.08,
+  "picture_s": 3.64
+ },
+ {
+  "pic": "r06-terminal-mobile.png",
+  "prompt_tokens": 1538,
+  "wall_s": 1.68,
+  "llm_read_s": 1.08,
+  "picture_s": 0.6
+ },
+ {
+  "pic": "s02-button-gaps.png",
+  "prompt_tokens": 1027,
+  "wall_s": 1.16,
+  "llm_read_s": 0.87,
+  "picture_s": 0.29
+ },
+ {
+  "pic": "big5k.png",
+  "prompt_tokens": 6063,
+  "wall_s": 9.79,
+  "llm_read_s": 2.67,
+  "picture_s": 7.12
+ }
+]
